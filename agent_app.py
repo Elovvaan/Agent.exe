@@ -535,8 +535,14 @@ class AgentApp:
         enriched: list[str] = []
         warnings: list[str] = []
 
+        def _raw_text(key: str) -> str:
+            value = raw.get(key, "")
+            if value is None:
+                return ""
+            return str(value)
+
         # ---- name (required; must pass filesystem validation) ----
-        name = str(raw.get("name", "")).strip()
+        name = _raw_text("name").strip()
         if not name:
             raise ValueError("'name' is required and cannot be empty.")
         is_valid, validation_msg = self._validate_client_name(name)
@@ -545,35 +551,35 @@ class AgentApp:
         slug = self.sanitize_client_name(name)
 
         # ---- business_type ----
-        business_type = str(raw.get("business_type", "")).strip()
+        business_type = _raw_text("business_type").strip()
         if not business_type:
             business_type = "Local Business"
             enriched.append("business_type")
 
         # ---- brand_style ----
-        brand_style = str(raw.get("brand_style", "")).strip()
+        brand_style = _raw_text("brand_style").strip()
         if not brand_style:
             brand_style = "modern and professional"
             enriched.append("brand_style")
 
         # ---- email (normalize: lowercase + stripped) ----
-        email = str(raw.get("email", "")).strip().lower()
+        email = _raw_text("email").strip().lower()
         if not email:
             warnings.append("email is missing")
 
         # ---- phone (normalize: collapse internal whitespace) ----
-        phone = re.sub(r"\s+", " ", str(raw.get("phone", "")).strip())
+        phone = re.sub(r"\s+", " ", _raw_text("phone").strip())
         if not phone:
             warnings.append("phone is missing")
 
         # ---- instagram (strip leading @, lowercase) ----
-        instagram = str(raw.get("instagram", "")).strip()
+        instagram = _raw_text("instagram").strip()
         if instagram.startswith("@"):
             instagram = instagram[1:]
         instagram = instagram.lower()
 
         # ---- description (default if absent; truncate if over 500 chars) ----
-        description = str(raw.get("description", "")).strip()
+        description = _raw_text("description").strip()
         if not description:
             description = f"Welcome to {name}. We provide quality services to our clients."
             enriched.append("description")
@@ -582,23 +588,23 @@ class AgentApp:
             warnings.append("description truncated to 500 characters")
 
         # ---- cta_primary ----
-        cta_primary = str(raw.get("cta_primary", "")).strip()
+        cta_primary = _raw_text("cta_primary").strip()
         if not cta_primary:
             cta_primary = "Book a free call"
             enriched.append("cta_primary")
 
         # ---- cta_secondary ----
-        cta_secondary = str(raw.get("cta_secondary", "")).strip()
+        cta_secondary = _raw_text("cta_secondary").strip()
         if not cta_secondary:
             cta_secondary = "See our services"
             enriched.append("cta_secondary")
 
         # ---- completeness score (measured against raw input, before enrichment) ----
         scored_keys = (
-            "name", "business_type", "email", "phone",
+            "name", "business_type", "brand_style", "email", "phone",
             "instagram", "description", "cta_primary", "cta_secondary",
         )
-        filled = sum(1 for k in scored_keys if str(raw.get(k, "")).strip())
+        filled = sum(1 for k in scored_keys if _raw_text(k).strip())
         completeness_score = round(filled / len(scored_keys), 2)
 
         return ClientAnalysis(
