@@ -367,7 +367,7 @@ class AgentApp:
 
         client_slug = self.sanitize_client_name(raw_name)
         reserved_names = {
-            "CON", "PRN", "AUX", "NUL",
+            "CON", "PRN", "AUX", "NUL", "INBOX",
             "COM1", "COM2", "COM3", "COM4", "COM5",
             "COM6", "COM7", "COM8", "COM9",
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
