@@ -700,6 +700,120 @@ class AgentApp:
 
         return copied
 
+    def _resolve_unique_slug(self, base_slug: str) -> str:
+        """Return a collision-safe slug by appending a numeric suffix when needed."""
+        candidate = base_slug
+        index = 2
+        while (self.paths["clients"] / candidate).exists():
+            candidate = f"{base_slug}-{index}"
+            index += 1
+        return candidate
+
+    def _required_fields_valid_for_build(self, client_data: dict) -> bool:
+        required_fields = (
+            "name",
+            "business_type",
+            "brand_style",
+            "email",
+            "phone",
+            "instagram",
+            "description",
+            "cta_primary",
+            "cta_secondary",
+        )
+        return all(bool(str(client_data.get(field, "")).strip()) for field in required_fields)
+
+    def _execute_action_plan(self, client_analysis: ClientAnalysis) -> dict:
+        """
+        Execute analysis.action_plan in strict deterministic order (no parallelism).
+
+        Returns:
+            dict with:
+              - analysis: updated ClientAnalysis
+              - client_data: mutated build-ready dictionary
+              - client_root: final client folder
+              - copied: generated file count (0 if build not requested)
+        Raises:
+            Exception from failed step; caller is responsible for marking job failed.
+        """
+        ordered_steps = [
+            "ENRICH_DATA",
+            "GENERATE_DESCRIPTION",
+            "GENERATE_CTA",
+            "RESOLVE_SLUG",
+            "PROCEED_TO_BUILD",
+        ]
+        planned = set(client_analysis.action_plan)
+        client_data = client_analysis.to_dict()
+        final_slug = client_analysis.slug
+        copied = 0
+
+        for step in ordered_steps:
+            if step not in planned:
+                continue
+
+            self._log_activity(f"[ACTION] {step} status=started")
+            try:
+                if step == "ENRICH_DATA":
+                    if not client_data.get("business_type", "").strip():
+                        client_data["business_type"] = "Local Business"
+                    if not client_data.get("brand_style", "").strip():
+                        client_data["brand_style"] = "modern and professional"
+
+                elif step == "GENERATE_DESCRIPTION":
+                    if not client_data.get("description", "").strip():
+                        client_data["description"] = (
+                            f"Welcome to {client_data['name']}. "
+                            "We provide quality services to our clients."
+                        )
+
+                elif step == "GENERATE_CTA":
+                    if not client_data.get("cta_primary", "").strip():
+                        client_data["cta_primary"] = "Book a free call"
+                    if not client_data.get("cta_secondary", "").strip():
+                        client_data["cta_secondary"] = "See our services"
+
+                elif step == "RESOLVE_SLUG":
+                    final_slug = self._resolve_unique_slug(final_slug)
+
+                elif step == "PROCEED_TO_BUILD":
+                    if not self._required_fields_valid_for_build(client_data):
+                        raise ValueError("Required fields missing; cannot proceed to build.")
+                    client_root = self.paths["clients"] / final_slug
+                    (client_root / "assets").mkdir(parents=True, exist_ok=True)
+                    (client_root / "site").mkdir(parents=True, exist_ok=True)
+                    (client_root / "notes").mkdir(parents=True, exist_ok=True)
+                    copied = self._run_site_generation(client_root, client_data)
+
+                self._log_activity(f"[ACTION] {step} status=success")
+            except Exception:
+                self._log_activity(f"[ACTION] {step} status=failed")
+                raise
+
+        updated_analysis = ClientAnalysis(
+            name=client_analysis.name,
+            slug=final_slug,
+            business_type=client_data["business_type"],
+            brand_style=client_data["brand_style"],
+            email=client_data["email"],
+            phone=client_data["phone"],
+            instagram=client_data["instagram"],
+            description=client_data["description"],
+            cta_primary=client_data["cta_primary"],
+            cta_secondary=client_data["cta_secondary"],
+            completeness_score=client_analysis.completeness_score,
+            enriched_fields=client_analysis.enriched_fields,
+            validation_warnings=client_analysis.validation_warnings,
+            action_plan=client_analysis.action_plan,
+        )
+
+        return {
+            "analysis": updated_analysis,
+            "client_data": client_data,
+            "client_root": self.paths["clients"] / final_slug,
+            "copied": copied,
+        }
+
     def generate_site(self):
         """Manual Generate Site button handler."""
         client_root = self._require_selected_client()
@@ -863,29 +977,23 @@ class AgentApp:
 
             # 2. Decision layer: validate, enrich, normalize
             analysis = self._analyze_client(raw_data)
-            self._log_analysis(analysis, job_name)
 
-            # 3. Truth lookup in clients/ for existing client
-            existing_client_root = self._lookup_existing_client_root(analysis.slug)
-            client_root = existing_client_root or (self.paths["clients"] / analysis.slug)
-            # 4. Refuse to overwrite an existing client unless explicitly allowed
-            overwrite_existing = raw_data.get("overwrite") is True
-            if existing_client_root and not overwrite_existing:
-                raise FileExistsError(
-                    f"Client folder already exists for slug '{analysis.slug}'. "
-                    f"Set 'overwrite': true in client.json to replace it."
-                )
+            # 3. Execute action plan deterministically (may resolve slug and build site)
+            execution = self._execute_action_plan(analysis)
+            final_analysis: ClientAnalysis = execution["analysis"]
+            client_data: dict = execution["client_data"]
+            client_root: Path = execution["client_root"]
+            copied: int = execution["copied"]
 
-            # 5. Create client directory structure
+            # 4. Persist structured analysis and normalized client data
+            self._log_analysis(final_analysis, job_name)
             (client_root / "assets").mkdir(parents=True, exist_ok=True)
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
-
-            # 6. Write notes/client.json (enriched, normalized data)
             notes_file = client_root / "notes" / "client.json"
-            notes_file.write_text(json.dumps(analysis.to_dict(), indent=2), encoding="utf-8")
+            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
 
-            # 7. Copy any assets bundled with the job
+            # 5. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
             if job_assets.is_dir():
                 for src in job_assets.rglob("*"):
@@ -894,19 +1002,16 @@ class AgentApp:
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, dst)
 
-            # 8. Generate site using analyzed data
-            copied = self._run_site_generation(client_root, analysis.to_dict())
-
-            # 9. Mark completed
+            # 6. Mark completed
             self._set_job_status(job_dir, JOB_COMPLETED)
 
             with self._auto_lock:
                 self._stats["processed"] += 1
 
             self._log_activity(
-                f"Job completed: {job_name} → {analysis.slug} ({copied} file(s))"
+                f"Job completed: {job_name} → {final_analysis.slug} ({copied} file(s))"
             )
-            self._schedule_ui_update(self._on_job_complete, analysis.slug)
+            self._schedule_ui_update(self._on_job_complete, final_analysis.slug)
 
         except Exception as exc:
             error_msg = str(exc)
