@@ -534,7 +534,8 @@ class AgentApp:
     def _show_error(self, msg: str):
         self._log_error(msg)
         self.status_var.set(f"Error: {msg}")
-        messagebox.showerror("Agent.exe", msg)
+        dialog_title = getattr(self, "app_title", "Agent.exe")
+        messagebox.showerror(dialog_title, msg)
 
     def _validate_required_placeholders(self, template_files: list[Path]) -> None:
         template_text = []
