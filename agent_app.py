@@ -210,13 +210,14 @@ class AgentApp:
         )
         if not new_root:
             return
-        self.base_dir = Path(new_root)
-        if not self.base_dir.exists():
-            self._show_error(f"SSD root path does not exist: {self.base_dir}")
+        candidate_base_dir = Path(new_root)
+        if not candidate_base_dir.exists():
+            self._show_error(f"SSD root path does not exist: {candidate_base_dir}")
             return
-        if not os.access(self.base_dir, os.R_OK | os.W_OK):
-            self._show_error(f"SSD root must be readable and writable: {self.base_dir}")
+        if not os.access(candidate_base_dir, os.R_OK | os.W_OK):
+            self._show_error(f"SSD root must be readable and writable: {candidate_base_dir}")
             return
+        self.base_dir = candidate_base_dir
         self.paths.update(
             {
                 "clients": self.base_dir / "clients",
