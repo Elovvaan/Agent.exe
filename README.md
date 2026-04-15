@@ -44,7 +44,7 @@ The app will auto-create any missing folders on first launch.
 Run from project root:
 
 ```powershell
-pyinstaller --noconfirm --onefile --windowed --name Agent agent_app.py
+pyinstaller --onefile --windowed --name Agent agent_app.py
 ```
 
 Expected Windows output:
@@ -53,7 +53,28 @@ Expected Windows output:
 dist/Agent.exe
 ```
 
-## 5) Runtime behavior
+## 5) Automated Windows build artifact (GitHub Actions)
+A workflow is provided at `.github/workflows/build-windows.yml` and performs:
+
+1. Install PyInstaller on `windows-latest`.
+2. Run:
+   ```powershell
+   pyinstaller --onefile --windowed --name Agent agent_app.py
+   ```
+3. Package output files into a single artifact named `Agent-windows-bundle` containing:
+   - `Agent.exe`
+   - `config.json`
+   - `templates/base-site/*`
+
+After pushing to GitHub, download from:
+
+```text
+https://github.com/<OWNER>/<REPO>/actions/runs/<RUN_ID>
+```
+
+Then open **Artifacts** → `Agent-windows-bundle`.
+
+## 6) Runtime behavior
 - **New Client** creates `clients/{client-name}/assets`, `site`, and `notes/client.json`.
 - **Open Client** selects client from SSD `clients/`.
 - **Generate Site** reads `templates/base-site` and writes to `clients/{client-name}/site`.
@@ -61,7 +82,7 @@ dist/Agent.exe
 - **Export Deploy** copies site files to `deploy/{client-name}`.
 - **Open SSD Folder** opens the SSD root folder.
 
-## 6) Support files
+## 7) Support files
 - `agent_app.py`
 - `config.json`
 - `templates/base-site/*`
