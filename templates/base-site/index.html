@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{BUSINESS_NAME}}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; color: #1f2937; background: #f8fafc; }
+    .wrap { max-width: 900px; margin: 40px auto; padding: 24px; background: #fff; border-radius: 12px; }
+    .actions a { margin-right: 12px; text-decoration: none; }
+    .cta { display: inline-block; background: #0f766e; color: #fff; padding: 10px 14px; border-radius: 8px; }
+    .secondary { color: #0f766e; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>{{BUSINESS_NAME}}</h1>
+    <p><strong>Type:</strong> {{BUSINESS_TYPE}}</p>
+    <p>{{DESCRIPTION}}</p>
+
+    <section class="actions">
+      <a class="cta" href="mailto:{{EMAIL}}">{{CTA_PRIMARY}}</a>
+      <a class="secondary" href="#services">{{CTA_SECONDARY}}</a>
+    </section>
+
+    <hr />
+    <p>Email: <a href="mailto:{{EMAIL}}">{{EMAIL}}</a></p>
+    <p>Phone: <a href="tel:{{PHONE}}">{{PHONE}}</a></p>
+    <p>Instagram: <a href="https://instagram.com/{{INSTAGRAM}}" target="_blank">@{{INSTAGRAM}}</a></p>
+  </main>
+</body>
+</html>
