@@ -5,8 +5,10 @@ import shutil
 import sys
 import webbrowser
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, TOP, VERTICAL, W, Button, Entry, Frame, Label, Listbox, Menu, Scrollbar, StringVar, Tk, Toplevel, filedialog, messagebox
+from urllib.parse import quote
 
 
 PLACEHOLDERS = {
@@ -305,6 +307,27 @@ class AgentApp:
         with notes_file.open("r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _is_html_like_file(self, path: Path) -> bool:
+        return path.suffix.lower() in {".html", ".svg", ".xml"}
+
+    def _get_safe_placeholder_value(self, path: Path, placeholder: str, key: str, client_data: dict) -> str:
+        value = str(client_data.get(key, ""))
+        if not self._is_html_like_file(path):
+            return value
+
+        placeholder_name = placeholder.upper()
+
+        if "MAILTO" in placeholder_name or ("EMAIL" in placeholder_name and any(token in placeholder_name for token in ("HREF", "URL", "LINK"))):
+            return quote(value, safe="@._+-")
+
+        if "TEL" in placeholder_name or ("PHONE" in placeholder_name and any(token in placeholder_name for token in ("HREF", "URL", "LINK"))):
+            return quote(value, safe="+0123456789()-")
+
+        if "INSTAGRAM" in placeholder_name and any(token in placeholder_name for token in ("HREF", "URL", "LINK", "PATH", "HANDLE")):
+            return quote(value, safe="._")
+
+        return escape(value, quote=True)
+
     def generate_site(self):
         client_root = self._require_selected_client()
         if not client_root:
@@ -333,7 +356,10 @@ class AgentApp:
                 if self._is_text_file(src):
                     content = src.read_text(encoding="utf-8", errors="replace")
                     for placeholder, key in PLACEHOLDERS.items():
-                        content = content.replace(placeholder, str(client_data.get(key, "")))
+                        content = content.replace(
+                            placeholder,
+                            self._get_safe_placeholder_value(src, placeholder, key, client_data),
+                        )
                     dst.write_text(content, encoding="utf-8")
                 else:
                     shutil.copy2(src, dst)
