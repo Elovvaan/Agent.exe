@@ -417,7 +417,7 @@ class AgentApp:
 
         client_slug = self.sanitize_client_name(raw_name)
         reserved_names = {
-            "CON", "PRN", "AUX", "NUL",
+            "CON", "PRN", "AUX", "NUL", "INBOX",
             "COM1", "COM2", "COM3", "COM4", "COM5",
             "COM6", "COM7", "COM8", "COM9",
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
@@ -743,7 +743,10 @@ class AgentApp:
                 try:
                     self._scan_and_process_inbox()
                 except Exception as exc:
-                    self._log_activity(f"[ERROR] Unhandled exception in auto loop: {exc}")
+                    self._log_activity(
+                        f"[ERROR] Unhandled exception in auto loop: {exc}\n"
+                        f"{traceback.format_exc()}"
+                    )
             self._stop_event.wait(timeout=INBOX_SCAN_INTERVAL)
 
     def _scan_and_process_inbox(self) -> None:
@@ -779,8 +782,11 @@ class AgentApp:
         try:
             data = json.loads(job_file.read_text(encoding="utf-8"))
             return data.get("status", JOB_PENDING)
-        except Exception:
-            return JOB_PENDING
+        except Exception as exc:
+            self._log_activity(
+                f"[WARN] Invalid job.json for {job_dir.name}; marking job as failed until fixed: {exc}"
+            )
+            return JOB_FAILED
 
     def _set_job_status(self, job_dir: Path, status: str, error: str = "") -> None:
         job_file = job_dir / "job.json"
@@ -823,6 +829,15 @@ class AgentApp:
 
             # 3. Create client directory structure
             client_root = self.paths["clients"] / analysis.slug
+            # 4. Refuse to overwrite an existing client unless explicitly allowed
+            overwrite_existing = client_data.get("overwrite") is True
+            if client_root.exists() and not overwrite_existing:
+                raise FileExistsError(
+                    f"Client folder already exists for slug '{client_slug}'. "
+                    f"Set 'overwrite': true in client.json to replace it."
+                )
+
+            # 5. Create client directory structure
             (client_root / "assets").mkdir(parents=True, exist_ok=True)
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
@@ -834,6 +849,7 @@ class AgentApp:
             # 5. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
             if job_assets.is_dir():
+                job_assets_root = job_assets.resolve()
                 for src in job_assets.rglob("*"):
                     if src.is_file():
                         dst = client_root / "assets" / src.relative_to(job_assets)
@@ -842,6 +858,20 @@ class AgentApp:
 
             # 6. Generate site using analyzed data
             copied = self._run_site_generation(client_root, analysis.to_dict())
+                    if not src.is_file() or src.is_symlink():
+                        continue
+
+                    resolved_src = src.resolve()
+                    try:
+                        resolved_src.relative_to(job_assets_root)
+                    except ValueError:
+                        continue
+
+                    dst = client_root / "assets" / src.relative_to(job_assets)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+            # 7. Generate site
+            copied = self._run_site_generation(client_root, client_data)
 
             # 7. Mark completed
             self._set_job_status(job_dir, JOB_COMPLETED)
@@ -885,10 +915,27 @@ class AgentApp:
         except Exception:
             pass  # App is closing
 
+    def _join_background_threads(self, timeout: float = 2.0) -> None:
+        """Wait briefly for app-owned background threads to stop."""
+        current = threading.current_thread()
+        seen = set()
+
+        for value in self.__dict__.values():
+            if not isinstance(value, threading.Thread):
+                continue
+            if value is current or not value.is_alive():
+                continue
+            ident = id(value)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            value.join(timeout)
+
     def _on_close(self) -> None:
-        """Signal the background thread to stop, then destroy the window."""
+        """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
+        self._join_background_threads(timeout=2.0)
         self.root.destroy()
 
     # ------------------------------------------------------------------ #
