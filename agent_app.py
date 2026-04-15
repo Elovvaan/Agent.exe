@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import sys
+import traceback
 import webbrowser
 from dataclasses import dataclass
 from html import escape
@@ -22,6 +23,18 @@ PLACEHOLDERS = {
     "{{CTA_PRIMARY}}": "cta_primary",
     "{{CTA_SECONDARY}}": "cta_secondary",
 }
+
+REQUIRED_ROOT_FOLDERS = ("clients", "templates", "prompts", "assets", "deploy", "tools", "logs")
+REQUIRED_TEMPLATE_PLACEHOLDERS = (
+    "{{BUSINESS_NAME}}",
+    "{{BUSINESS_TYPE}}",
+    "{{EMAIL}}",
+    "{{PHONE}}",
+    "{{INSTAGRAM}}",
+    "{{DESCRIPTION}}",
+    "{{CTA_PRIMARY}}",
+    "{{CTA_SECONDARY}}",
+)
 
 
 @dataclass
@@ -100,8 +113,19 @@ class AgentApp:
             return {}
 
     def _ensure_core_structure(self) -> None:
-        for key in ("clients", "templates", "prompts", "assets", "deploy", "tools", "logs"):
+        for key in REQUIRED_ROOT_FOLDERS:
             self.paths[key].mkdir(parents=True, exist_ok=True)
+        (self.base_dir / "templates" / "base-site").mkdir(parents=True, exist_ok=True)
+        if not self.paths["config"].exists():
+            default_config = {
+                "title": "Agent.exe",
+                "version": "1.0.0",
+                "tagline": "Portable SSD Web Agency",
+            }
+            self.paths["config"].write_text(
+                json.dumps(default_config, indent=2),
+                encoding="utf-8",
+            )
 
     def _build_ui(self) -> None:
         main = Frame(self.root, padx=14, pady=14)
@@ -187,6 +211,12 @@ class AgentApp:
         if not new_root:
             return
         self.base_dir = Path(new_root)
+        if not self.base_dir.exists():
+            self._show_error(f"SSD root path does not exist: {self.base_dir}")
+            return
+        if not os.access(self.base_dir, os.R_OK | os.W_OK):
+            self._show_error(f"SSD root must be readable and writable: {self.base_dir}")
+            return
         self.paths.update(
             {
                 "clients": self.base_dir / "clients",
@@ -262,7 +292,23 @@ class AgentApp:
         cleaned = re.sub(r"-+", "-", cleaned).strip("-")
         return cleaned or "client"
 
+    def _validate_client_name(self, raw_name: str) -> tuple[bool, str]:
+        cleaned = raw_name.strip()
+        if not cleaned:
+            return False, "Client Name is required."
+        if len(cleaned) > 80:
+            return False, "Client Name is too long (max 80 characters)."
+        if cleaned in {".", ".."}:
+            return False, "Client Name cannot be '.' or '..'."
+        if re.search(r'[<>:"/\\|?*]', cleaned):
+            return False, "Client Name contains invalid filesystem characters."
+        return True, ""
+
     def create_client(self, data: ClientData) -> None:
+        is_valid, validation_message = self._validate_client_name(data.name)
+        if not is_valid:
+            self._show_error(validation_message)
+            return
         client_slug = self.sanitize_client_name(data.name)
         client_root = self.paths["clients"] / client_slug
         notes_file = client_root / "notes" / "client.json"
@@ -349,9 +395,18 @@ class AgentApp:
         if not template_root.exists():
             self._show_error(f"Template folder not found: {template_root}")
             return
+        template_index = template_root / "index.html"
+        if not template_index.exists():
+            self._show_error(f"Template file missing: {template_index}")
+            return
 
         try:
             client_data = self._read_client_data(client_root)
+            template_files = [p for p in template_root.rglob("*") if p.is_file()]
+            if not template_files:
+                self._show_error(f"No template files found in: {template_root}")
+                return
+            self._validate_required_placeholders(template_files)
             target_site = client_root / "site"
             if target_site.exists():
                 shutil.rmtree(target_site)
@@ -445,8 +500,32 @@ class AgentApp:
         return path.suffix.lower() in text_extensions
 
     def _show_error(self, msg: str):
+        self._log_error(msg)
         self.status_var.set(f"Error: {msg}")
         messagebox.showerror("Agent.exe", msg)
+
+    def _validate_required_placeholders(self, template_files: list[Path]) -> None:
+        template_text = []
+        for file_path in template_files:
+            if self._is_text_file(file_path):
+                template_text.append(file_path.read_text(encoding="utf-8", errors="replace"))
+        full_template_text = "\n".join(template_text)
+        missing = [p for p in REQUIRED_TEMPLATE_PLACEHOLDERS if p not in full_template_text]
+        if missing:
+            missing_text = ", ".join(missing)
+            raise ValueError(f"Template placeholders missing: {missing_text}")
+
+    def _log_error(self, message: str) -> None:
+        try:
+            logs_path = self.paths["logs"]
+            logs_path.mkdir(parents=True, exist_ok=True)
+            log_file = logs_path / "agent.log"
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"{message}\n")
+                f.write(traceback.format_exc())
+                f.write("\n")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
