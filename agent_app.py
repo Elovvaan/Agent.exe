@@ -493,6 +493,12 @@ class AgentApp:
         with notes_file.open("r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _lookup_existing_client_root(self, client_slug: str) -> Path | None:
+        client_root = self.paths["clients"] / client_slug
+        if client_root.exists() and client_root.is_dir():
+            return client_root
+        return None
+
     # ------------------------------------------------------------------ #
     #  Site generation
     # ------------------------------------------------------------------ #
@@ -650,6 +656,11 @@ class AgentApp:
         Thread-safe — no Tkinter calls.
         Returns the number of files written.  Raises on any failure.
         """
+        truth_client_root = self._lookup_existing_client_root(client_root.name)
+        if not truth_client_root:
+            raise FileNotFoundError(f"Client folder not found in clients/: {client_root.name}")
+        client_root = truth_client_root
+
         template_root = self.paths["templates"]
         if not template_root.exists():
             raise FileNotFoundError(f"Template folder not found: {template_root}")
@@ -854,11 +865,12 @@ class AgentApp:
             analysis = self._analyze_client(raw_data)
             self._log_analysis(analysis, job_name)
 
-            # 3. Create client directory structure
-            client_root = self.paths["clients"] / analysis.slug
+            # 3. Truth lookup in clients/ for existing client
+            existing_client_root = self._lookup_existing_client_root(analysis.slug)
+            client_root = existing_client_root or (self.paths["clients"] / analysis.slug)
             # 4. Refuse to overwrite an existing client unless explicitly allowed
             overwrite_existing = raw_data.get("overwrite") is True
-            if client_root.exists() and not overwrite_existing:
+            if existing_client_root and not overwrite_existing:
                 raise FileExistsError(
                     f"Client folder already exists for slug '{analysis.slug}'. "
                     f"Set 'overwrite': true in client.json to replace it."
