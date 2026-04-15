@@ -14,6 +14,7 @@ from urllib.parse import quote
 PLACEHOLDERS = {
     "{{BUSINESS_NAME}}": "name",
     "{{BUSINESS_TYPE}}": "business_type",
+    "{{BRAND_STYLE}}": "brand_style",
     "{{EMAIL}}": "email",
     "{{PHONE}}": "phone",
     "{{INSTAGRAM}}": "instagram",
