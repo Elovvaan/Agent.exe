@@ -703,12 +703,20 @@ class AgentApp:
             # 6. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
             if job_assets.is_dir():
+                job_assets_root = job_assets.resolve()
                 for src in job_assets.rglob("*"):
-                    if src.is_file():
-                        dst = client_root / "assets" / src.relative_to(job_assets)
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dst)
+                    if not src.is_file() or src.is_symlink():
+                        continue
 
+                    resolved_src = src.resolve()
+                    try:
+                        resolved_src.relative_to(job_assets_root)
+                    except ValueError:
+                        continue
+
+                    dst = client_root / "assets" / src.relative_to(job_assets)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
             # 7. Generate site
             copied = self._run_site_generation(client_root, client_data)
 
