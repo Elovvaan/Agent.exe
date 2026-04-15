@@ -77,6 +77,56 @@ class ClientData:
         }
 
 
+@dataclass
+class ClientAnalysis:
+    """Structured, validated, enriched output from the decision layer."""
+    name: str
+    slug: str
+    business_type: str
+    brand_style: str
+    email: str
+    phone: str
+    instagram: str
+    description: str
+    cta_primary: str
+    cta_secondary: str
+    completeness_score: float       # 0.0–1.0 based on fields present in raw input
+    enriched_fields: list[str]      # fields absent in raw input, filled with defaults
+    validation_warnings: list[str]  # non-fatal issues detected during analysis
+
+    def to_dict(self) -> dict:
+        """Clean field values consumed by _run_site_generation."""
+        return {
+            "name": self.name,
+            "business_type": self.business_type,
+            "brand_style": self.brand_style,
+            "email": self.email,
+            "phone": self.phone,
+            "instagram": self.instagram,
+            "description": self.description,
+            "cta_primary": self.cta_primary,
+            "cta_secondary": self.cta_secondary,
+        }
+
+    def to_log_dict(self) -> dict:
+        """Full structured record written to analysis.log."""
+        return {
+            "name": self.name,
+            "slug": self.slug,
+            "business_type": self.business_type,
+            "brand_style": self.brand_style,
+            "email": self.email,
+            "phone": self.phone,
+            "instagram": self.instagram,
+            "description": self.description,
+            "cta_primary": self.cta_primary,
+            "cta_secondary": self.cta_secondary,
+            "completeness_score": self.completeness_score,
+            "enriched_fields": self.enriched_fields,
+            "validation_warnings": self.validation_warnings,
+        }
+
+
 class AgentApp:
     def __init__(self, root: Tk):
         self.root = root
@@ -473,6 +523,100 @@ class AgentApp:
 
         return escape(value, quote=True)
 
+    def _analyze_client(self, raw: dict) -> ClientAnalysis:
+        """
+        Decision layer: validate, enrich, and normalize raw client data.
+
+        Raises ValueError for unrecoverable problems (empty name, reserved name).
+        All other missing fields are filled with safe defaults.
+        Returns a fully-populated ClientAnalysis — no free-form text, structured
+        schema only.
+        """
+        enriched: list[str] = []
+        warnings: list[str] = []
+
+        # ---- name (required; must pass filesystem validation) ----
+        name = str(raw.get("name", "")).strip()
+        if not name:
+            raise ValueError("'name' is required and cannot be empty.")
+        is_valid, validation_msg = self._validate_client_name(name)
+        if not is_valid:
+            raise ValueError(validation_msg)
+        slug = self.sanitize_client_name(name)
+
+        # ---- business_type ----
+        business_type = str(raw.get("business_type", "")).strip()
+        if not business_type:
+            business_type = "Local Business"
+            enriched.append("business_type")
+
+        # ---- brand_style ----
+        brand_style = str(raw.get("brand_style", "")).strip()
+        if not brand_style:
+            brand_style = "modern and professional"
+            enriched.append("brand_style")
+
+        # ---- email (normalize: lowercase + stripped) ----
+        email = str(raw.get("email", "")).strip().lower()
+        if not email:
+            warnings.append("email is missing")
+
+        # ---- phone (normalize: collapse internal whitespace) ----
+        phone = re.sub(r"\s+", " ", str(raw.get("phone", "")).strip())
+        if not phone:
+            warnings.append("phone is missing")
+
+        # ---- instagram (strip leading @, lowercase) ----
+        instagram = str(raw.get("instagram", "")).strip()
+        if instagram.startswith("@"):
+            instagram = instagram[1:]
+        instagram = instagram.lower()
+
+        # ---- description (default if absent; truncate if over 500 chars) ----
+        description = str(raw.get("description", "")).strip()
+        if not description:
+            description = f"Welcome to {name}. We provide quality services to our clients."
+            enriched.append("description")
+        elif len(description) > 500:
+            description = description[:497] + "..."
+            warnings.append("description truncated to 500 characters")
+
+        # ---- cta_primary ----
+        cta_primary = str(raw.get("cta_primary", "")).strip()
+        if not cta_primary:
+            cta_primary = "Book a free call"
+            enriched.append("cta_primary")
+
+        # ---- cta_secondary ----
+        cta_secondary = str(raw.get("cta_secondary", "")).strip()
+        if not cta_secondary:
+            cta_secondary = "See our services"
+            enriched.append("cta_secondary")
+
+        # ---- completeness score (measured against raw input, before enrichment) ----
+        scored_keys = (
+            "name", "business_type", "email", "phone",
+            "instagram", "description", "cta_primary", "cta_secondary",
+        )
+        filled = sum(1 for k in scored_keys if str(raw.get(k, "")).strip())
+        completeness_score = round(filled / len(scored_keys), 2)
+
+        return ClientAnalysis(
+            name=name,
+            slug=slug,
+            business_type=business_type,
+            brand_style=brand_style,
+            email=email,
+            phone=phone,
+            instagram=instagram,
+            description=description,
+            cta_primary=cta_primary,
+            cta_secondary=cta_secondary,
+            completeness_score=completeness_score,
+            enriched_fields=enriched,
+            validation_warnings=warnings,
+        )
+
     def _run_site_generation(self, client_root: Path, client_data: dict) -> int:
         """
         Core site-generation pipeline.
@@ -524,8 +668,10 @@ class AgentApp:
         if not client_root:
             return
         try:
-            client_data = self._read_client_data(client_root)
-            copied = self._run_site_generation(client_root, client_data)
+            raw_data = self._read_client_data(client_root)
+            analysis = self._analyze_client(raw_data)
+            self._log_analysis(analysis, self.selected_client or "manual")
+            copied = self._run_site_generation(client_root, analysis.to_dict())
             self.status_var.set(f"Generated site for {self.selected_client} ({copied} files).")
             messagebox.showinfo("Generate Site", f"Generated {copied} files for {self.selected_client}.")
         except Exception as exc:
@@ -664,35 +810,28 @@ class AgentApp:
         self._schedule_ui_update(self.status_var.set, f"Auto: processing '{job_name}'...")
 
         try:
-            # 1. Read client.json from the job folder
+            # 1. Read raw client.json from the job folder
             client_json_path = job_dir / "client.json"
             if not client_json_path.exists():
                 raise FileNotFoundError(f"client.json not found in job folder: {job_name}")
             with client_json_path.open("r", encoding="utf-8") as f:
-                client_data = json.load(f)
+                raw_data = json.load(f)
 
-            # 2. Validate client name
-            raw_name = client_data.get("name", "").strip()
-            if not raw_name:
-                raise ValueError("client.json is missing the required 'name' field.")
-            is_valid, msg = self._validate_client_name(raw_name)
-            if not is_valid:
-                raise ValueError(f"Invalid client name: {msg}")
+            # 2. Decision layer: validate, enrich, normalize
+            analysis = self._analyze_client(raw_data)
+            self._log_analysis(analysis, job_name)
 
-            # 3. Resolve slug and paths
-            client_slug = self.sanitize_client_name(raw_name)
-            client_root = self.paths["clients"] / client_slug
-
-            # 4. Create client directory structure
+            # 3. Create client directory structure
+            client_root = self.paths["clients"] / analysis.slug
             (client_root / "assets").mkdir(parents=True, exist_ok=True)
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
 
-            # 5. Write notes/client.json
+            # 4. Write notes/client.json (enriched, normalized data)
             notes_file = client_root / "notes" / "client.json"
-            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            notes_file.write_text(json.dumps(analysis.to_dict(), indent=2), encoding="utf-8")
 
-            # 6. Copy any assets bundled with the job
+            # 5. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
             if job_assets.is_dir():
                 for src in job_assets.rglob("*"):
@@ -701,19 +840,19 @@ class AgentApp:
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, dst)
 
-            # 7. Generate site
-            copied = self._run_site_generation(client_root, client_data)
+            # 6. Generate site using analyzed data
+            copied = self._run_site_generation(client_root, analysis.to_dict())
 
-            # 8. Mark completed
+            # 7. Mark completed
             self._set_job_status(job_dir, JOB_COMPLETED)
 
             with self._auto_lock:
                 self._stats["processed"] += 1
 
             self._log_activity(
-                f"Job completed: {job_name} → {client_slug} ({copied} file(s))"
+                f"Job completed: {job_name} → {analysis.slug} ({copied} file(s))"
             )
-            self._schedule_ui_update(self._on_job_complete, client_slug)
+            self._schedule_ui_update(self._on_job_complete, analysis.slug)
 
         except Exception as exc:
             error_msg = str(exc)
@@ -803,6 +942,22 @@ class AgentApp:
                 if sys.exc_info()[0] is not None:
                     f.write(traceback.format_exc())
                     f.write("\n")
+        except Exception:
+            pass
+
+    def _log_analysis(self, analysis: ClientAnalysis, source: str) -> None:
+        """Append one structured JSON record to logs/analysis.log (JSONL format)."""
+        try:
+            logs_path = self.paths["logs"]
+            logs_path.mkdir(parents=True, exist_ok=True)
+            log_file = logs_path / "analysis.log"
+            record = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "source": source,
+                "analysis": analysis.to_log_dict(),
+            }
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
         except Exception:
             pass
 
