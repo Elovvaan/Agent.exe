@@ -683,7 +683,15 @@ class AgentApp:
             client_slug = self.sanitize_client_name(raw_name)
             client_root = self.paths["clients"] / client_slug
 
-            # 4. Create client directory structure
+            # 4. Refuse to overwrite an existing client unless explicitly allowed
+            overwrite_existing = client_data.get("overwrite") is True
+            if client_root.exists() and not overwrite_existing:
+                raise FileExistsError(
+                    f"Client folder already exists for slug '{client_slug}'. "
+                    f"Set 'overwrite': true in client.json to replace it."
+                )
+
+            # 5. Create client directory structure
             (client_root / "assets").mkdir(parents=True, exist_ok=True)
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
