@@ -1,0 +1,42 @@
+name: Build Agent.exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - work
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --windowed --name Agent agent_app.py
+
+      - name: Stage portable bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bundle | Out-Null
+          Copy-Item dist/Agent.exe bundle/Agent.exe
+          Copy-Item config.json bundle/config.json
+          New-Item -ItemType Directory -Force -Path bundle/templates/base-site | Out-Null
+          Copy-Item templates/base-site/* bundle/templates/base-site -Recurse -Force
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Agent-windows-bundle
+          path: bundle
+          if-no-files-found: error
