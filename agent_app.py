@@ -352,6 +352,8 @@ class AgentApp:
         try:
             client_data = self._read_client_data(client_root)
             target_site = client_root / "site"
+            if target_site.exists():
+                shutil.rmtree(target_site)
             target_site.mkdir(parents=True, exist_ok=True)
 
             copied = 0
