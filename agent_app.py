@@ -302,6 +302,38 @@ class AgentApp:
             return False, "Client Name cannot be '.' or '..'."
         if re.search(r'[<>:"/\\|?*]', cleaned):
             return False, "Client Name contains invalid filesystem characters."
+
+        client_slug = self.sanitize_client_name(raw_name)
+        reserved_names = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+        }
+        normalized_slug = client_slug.rstrip(" .").split(".", 1)[0].upper()
+        if normalized_slug in reserved_names:
+            return (
+                False,
+                f"Client Name resolves to reserved Windows folder name '{client_slug}'. Choose a different name.",
+            )
         return True, ""
 
     def create_client(self, data: ClientData) -> None:
