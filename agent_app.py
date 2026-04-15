@@ -958,8 +958,8 @@ class AgentApp:
             }
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_error(f"Failed to write analysis log entry for source '{source}': {exc}")
 
     def _log_activity(self, message: str) -> None:
         try:
