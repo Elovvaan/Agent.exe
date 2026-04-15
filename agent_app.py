@@ -762,10 +762,27 @@ class AgentApp:
         except Exception:
             pass  # App is closing
 
+    def _join_background_threads(self, timeout: float = 2.0) -> None:
+        """Wait briefly for app-owned background threads to stop."""
+        current = threading.current_thread()
+        seen = set()
+
+        for value in self.__dict__.values():
+            if not isinstance(value, threading.Thread):
+                continue
+            if value is current or not value.is_alive():
+                continue
+            ident = id(value)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            value.join(timeout)
+
     def _on_close(self) -> None:
-        """Signal the background thread to stop, then destroy the window."""
+        """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
+        self._join_background_threads(timeout=2.0)
         self.root.destroy()
 
     # ------------------------------------------------------------------ #
