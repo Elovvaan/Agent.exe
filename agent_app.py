@@ -555,8 +555,9 @@ class AgentApp:
             log_file = logs_path / "agent.log"
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(f"{message}\n")
-                f.write(traceback.format_exc())
-                f.write("\n")
+                if sys.exc_info()[0] is not None:
+                    f.write(traceback.format_exc())
+                    f.write("\n")
         except Exception:
             pass
 
