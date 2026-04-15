@@ -597,7 +597,10 @@ class AgentApp:
                 try:
                     self._scan_and_process_inbox()
                 except Exception as exc:
-                    self._log_activity(f"[ERROR] Unhandled exception in auto loop: {exc}")
+                    self._log_activity(
+                        f"[ERROR] Unhandled exception in auto loop: {exc}\n"
+                        f"{traceback.format_exc()}"
+                    )
             self._stop_event.wait(timeout=INBOX_SCAN_INTERVAL)
 
     def _scan_and_process_inbox(self) -> None:
