@@ -251,12 +251,22 @@ class AgentApp:
     def create_client(self, data: ClientData) -> None:
         client_slug = self.sanitize_client_name(data.name)
         client_root = self.paths["clients"] / client_slug
+        notes_file = client_root / "notes" / "client.json"
         try:
+            if client_root.exists() or notes_file.exists():
+                overwrite = messagebox.askyesno(
+                    "Client already exists",
+                    f"Client '{client_slug}' already exists. Overwrite existing client metadata?",
+                )
+                if not overwrite:
+                    self.status_var.set(f"Client creation cancelled: {client_slug}")
+                    return
+
             (client_root / "assets").mkdir(parents=True, exist_ok=True)
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
 
-            with (client_root / "notes" / "client.json").open("w", encoding="utf-8") as f:
+            with notes_file.open("w", encoding="utf-8") as f:
                 json.dump(data.to_dict(), f, indent=2)
 
             self.refresh_client_list()
