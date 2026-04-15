@@ -636,8 +636,11 @@ class AgentApp:
         try:
             data = json.loads(job_file.read_text(encoding="utf-8"))
             return data.get("status", JOB_PENDING)
-        except Exception:
-            return JOB_PENDING
+        except Exception as exc:
+            self._log_activity(
+                f"[WARN] Invalid job.json for {job_dir.name}; marking job as failed until fixed: {exc}"
+            )
+            return JOB_FAILED
 
     def _set_job_status(self, job_dir: Path, status: str, error: str = "") -> None:
         job_file = job_dir / "job.json"
