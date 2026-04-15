@@ -52,7 +52,6 @@ class ClientData:
 class AgentApp:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("Agent.exe")
         self.root.geometry("620x430")
         self.root.minsize(620, 430)
 
@@ -67,6 +66,14 @@ class AgentApp:
             "logs": self.base_dir / "logs",
             "config": self.base_dir / "config.json",
         }
+
+        self.config = self._load_config()
+        self.app_title = self.config.get("title", "Agent.exe")
+        self.app_version = self.config.get("version", "")
+        self.app_tagline = self.config.get("tagline", "Portable SSD Web Agency")
+
+        window_title = self.app_title if not self.app_version else f"{self.app_title} {self.app_version}"
+        self.root.title(window_title)
 
         self.selected_client: str | None = None
 
@@ -99,7 +106,11 @@ class AgentApp:
         main = Frame(self.root, padx=14, pady=14)
         main.pack(fill=BOTH, expand=True)
 
-        title = Label(main, text="Agent.exe — Portable SSD Web Agency", font=("Segoe UI", 14, "bold"))
+        header_text = self.app_title if not self.app_version else f"{self.app_title} {self.app_version}"
+        if self.app_tagline:
+            header_text = f"{header_text} — {self.app_tagline}"
+
+        title = Label(main, text=header_text, font=("Segoe UI", 14, "bold"))
         title.pack(anchor=W, pady=(0, 10))
 
         body = Frame(main)
