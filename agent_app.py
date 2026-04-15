@@ -404,12 +404,13 @@ class AgentApp:
             self._show_error(f"Deploy export failed: {exc}")
 
     def open_ssd_folder(self):
-        target = str(self.base_dir)
+        target_path = self.base_dir.resolve()
+        target = str(target_path)
         try:
             if os.name == "nt":
                 os.startfile(target)  # type: ignore[attr-defined]
             else:
-                webbrowser.open(target)
+                webbrowser.open(target_path.as_uri())
             self.status_var.set(f"Opened SSD folder: {target}")
         except Exception as exc:
             self._show_error(f"Could not open SSD folder: {exc}")
