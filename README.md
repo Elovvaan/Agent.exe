@@ -1,12 +1,11 @@
-# Agent.exe
+# Agent.exe (Portable SSD Web Agency)
 
-Portable SSD-based web agency desktop app built with Python + Tkinter.
+## 1) SSD root layout (exact placement)
+Place these items in the **SSD root** (same folder level as `Agent.exe`):
 
-## Project Structure
-
-```
-Agent.exe/
-├─ agent_app.py
+```text
+<SSD_ROOT>/
+├─ Agent.exe
 ├─ config.json
 ├─ clients/
 ├─ templates/
@@ -19,57 +18,50 @@ Agent.exe/
 └─ logs/
 ```
 
-## What the compiled `Agent.exe` does
+The app will auto-create any missing folders on first launch.
 
-When launched from the SSD root, the app acts as a local control center:
+## 2) Launch
+- Double-click `Agent.exe` from the SSD root.
+- Or run in terminal:
 
-1. **New Client**
-   - Opens a form for Client Name, Business Type, Brand/Style, Email, Phone, Instagram, Short Description, and CTA text.
-   - Creates:
-     - `clients/{client-name}/assets`
-     - `clients/{client-name}/site`
-     - `clients/{client-name}/notes`
-   - Stores form data in `clients/{client-name}/notes/client.json`.
+```powershell
+.\Agent.exe
+```
 
-2. **Open Client**
-   - Refreshes and selects from discovered client folders.
+## 3) Required template placeholders
+`templates/base-site` must include these placeholders across template files:
 
-3. **Generate Site**
-   - Reads all files from `templates/base-site`.
-   - Replaces placeholders:
-     - `{{BUSINESS_NAME}}`
-     - `{{BUSINESS_TYPE}}`
-     - `{{EMAIL}}`
-     - `{{PHONE}}`
-     - `{{INSTAGRAM}}`
-     - `{{DESCRIPTION}}`
-     - `{{CTA_PRIMARY}}`
-     - `{{CTA_SECONDARY}}`
-   - Writes generated output to `clients/{client-name}/site`.
+- `{{BUSINESS_NAME}}`
+- `{{BUSINESS_TYPE}}`
+- `{{EMAIL}}`
+- `{{PHONE}}`
+- `{{INSTAGRAM}}`
+- `{{DESCRIPTION}}`
+- `{{CTA_PRIMARY}}`
+- `{{CTA_SECONDARY}}`
 
-4. **Preview Site**
-   - Opens `clients/{client-name}/site/index.html` in default browser.
+## 4) Build command (Windows)
+Run from project root:
 
-5. **Export Deploy**
-   - Copies `clients/{client-name}/site` into `deploy/{client-name}`.
-
-6. **Open SSD Folder**
-   - Opens SSD root folder in File Explorer on Windows.
-
-## Build a standalone Windows executable (PyInstaller)
-
-Run this command from the project root:
-
-```bash
+```powershell
 pyinstaller --noconfirm --onefile --windowed --name Agent agent_app.py
 ```
 
-After build:
-- `dist/Agent.exe` is your standalone executable.
-- Place `Agent.exe` in SSD root (next to `clients/`, `templates/`, `deploy/`, etc.) for expected portable behavior.
+Expected Windows output:
 
-## Notes
+```text
+dist/Agent.exe
+```
 
-- Offline/local only: no cloud APIs, no login, no database, no web framework.
-- Designed for SSD portability and robust path handling relative to where the executable is launched.
-- Includes clear error dialogs for missing files/folders and invalid operations.
+## 5) Runtime behavior
+- **New Client** creates `clients/{client-name}/assets`, `site`, and `notes/client.json`.
+- **Open Client** selects client from SSD `clients/`.
+- **Generate Site** reads `templates/base-site` and writes to `clients/{client-name}/site`.
+- **Preview Site** opens `clients/{client-name}/site/index.html`.
+- **Export Deploy** copies site files to `deploy/{client-name}`.
+- **Open SSD Folder** opens the SSD root folder.
+
+## 6) Support files
+- `agent_app.py`
+- `config.json`
+- `templates/base-site/*`
