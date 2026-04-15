@@ -93,6 +93,7 @@ class ClientAnalysis:
     completeness_score: float       # 0.0–1.0 based on fields present in raw input
     enriched_fields: list[str]      # fields absent in raw input, filled with defaults
     validation_warnings: list[str]  # non-fatal issues detected during analysis
+    action_plan: list[str]          # deterministic follow-up actions inferred from analysis
 
     def to_dict(self) -> dict:
         """Clean field values consumed by _run_site_generation."""
@@ -124,6 +125,7 @@ class ClientAnalysis:
             "completeness_score": self.completeness_score,
             "enriched_fields": self.enriched_fields,
             "validation_warnings": self.validation_warnings,
+            "action_plan": self.action_plan,
         }
 
 
@@ -604,8 +606,26 @@ class AgentApp:
             "name", "business_type", "brand_style", "email", "phone",
             "instagram", "description", "cta_primary", "cta_secondary",
         )
-        filled = sum(1 for k in scored_keys if _raw_text(k).strip())
+        raw_presence = {k: bool(_raw_text(k).strip()) for k in scored_keys}
+        filled = sum(1 for k in scored_keys if raw_presence[k])
         completeness_score = round(filled / len(scored_keys), 2)
+
+        # ---- action plan (deterministic ordering; analysis-only, no execution) ----
+        action_plan: list[str] = []
+        if completeness_score < 0.7:
+            action_plan.append("ENRICH_DATA")
+        if not raw_presence["description"]:
+            action_plan.append("GENERATE_DESCRIPTION")
+        if not raw_presence["cta_primary"] or not raw_presence["cta_secondary"]:
+            action_plan.append("GENERATE_CTA")
+
+        slug_conflict = (self.paths["clients"] / slug).exists() and (raw.get("overwrite") is not True)
+        if slug_conflict:
+            action_plan.append("RESOLVE_SLUG")
+        if warnings:
+            action_plan.append("LOG_WARNINGS")
+        if all(raw_presence.values()):
+            action_plan.append("PROCEED_TO_BUILD")
 
         return ClientAnalysis(
             name=name,
@@ -621,6 +641,7 @@ class AgentApp:
             completeness_score=completeness_score,
             enriched_fields=enriched,
             validation_warnings=warnings,
+            action_plan=action_plan,
         )
 
     def _run_site_generation(self, client_root: Path, client_data: dict) -> int:
