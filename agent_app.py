@@ -836,10 +836,10 @@ class AgentApp:
             # 3. Create client directory structure
             client_root = self.paths["clients"] / analysis.slug
             # 4. Refuse to overwrite an existing client unless explicitly allowed
-            overwrite_existing = client_data.get("overwrite") is True
+            overwrite_existing = raw_data.get("overwrite") is True
             if client_root.exists() and not overwrite_existing:
                 raise FileExistsError(
-                    f"Client folder already exists for slug '{client_slug}'. "
+                    f"Client folder already exists for slug '{analysis.slug}'. "
                     f"Set 'overwrite': true in client.json to replace it."
                 )
 
@@ -848,38 +848,23 @@ class AgentApp:
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
 
-            # 4. Write notes/client.json (enriched, normalized data)
+            # 6. Write notes/client.json (enriched, normalized data)
             notes_file = client_root / "notes" / "client.json"
             notes_file.write_text(json.dumps(analysis.to_dict(), indent=2), encoding="utf-8")
 
-            # 5. Copy any assets bundled with the job
+            # 7. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
             if job_assets.is_dir():
-                job_assets_root = job_assets.resolve()
                 for src in job_assets.rglob("*"):
                     if src.is_file():
                         dst = client_root / "assets" / src.relative_to(job_assets)
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, dst)
 
-            # 6. Generate site using analyzed data
+            # 8. Generate site using analyzed data
             copied = self._run_site_generation(client_root, analysis.to_dict())
-                    if not src.is_file() or src.is_symlink():
-                        continue
 
-                    resolved_src = src.resolve()
-                    try:
-                        resolved_src.relative_to(job_assets_root)
-                    except ValueError:
-                        continue
-
-                    dst = client_root / "assets" / src.relative_to(job_assets)
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
-            # 7. Generate site
-            copied = self._run_site_generation(client_root, client_data)
-
-            # 7. Mark completed
+            # 9. Mark completed
             self._set_job_status(job_dir, JOB_COMPLETED)
 
             with self._auto_lock:
