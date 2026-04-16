@@ -3659,8 +3659,7 @@ class AgentApp:
     def _resolve_markdown_client_context(self, file_path: Path) -> tuple[str, str]:
         try:
             relative_parent = file_path.resolve().parent.relative_to(self.paths["clients"].resolve())
-            segments = [part for part in relative_parent.parts if part and part != "."]
-            segments = [part for part in segments if part != "inbox"]
+            segments = [part for part in relative_parent.parts if part and part not in (".", "inbox")]
             if segments:
                 client_slug = self.sanitize_client_name(str(segments[0]))
                 context_id = "/".join(segments)
@@ -3842,8 +3841,9 @@ class AgentApp:
             previous = self._markdown_file_state.get(key, {})
             if signature != previous.get("signature", ""):
                 changed_files.append(path)
-        for stale in [key for key in self._markdown_file_state.keys() if key not in live_paths]:
-            self._markdown_file_state.pop(stale, None)
+        for stale in list(self._markdown_file_state.keys()):
+            if stale not in live_paths:
+                self._markdown_file_state.pop(stale, None)
         total_injected = 0
         for file_path in changed_files:
             key = str(file_path.resolve())
@@ -3859,9 +3859,14 @@ class AgentApp:
                         f"[MARKDOWN] injected file={file_path.name} total={len(parsed)} delta={len(delta)} slug={slug}"
                     )
                 stat = file_path.stat()
+                task_fingerprints = []
+                for item in parsed:
+                    fingerprint = str(item.get("task_fingerprint", ""))
+                    if fingerprint:
+                        task_fingerprints.append(fingerprint)
                 self._markdown_file_state[key] = {
                     "signature": f"{stat.st_mtime_ns}:{stat.st_size}",
-                    "task_fingerprints": [str(item.get("task_fingerprint", "")) for item in parsed if str(item.get("task_fingerprint", ""))],
+                    "task_fingerprints": task_fingerprints,
                 }
             except Exception as exc:
                 client_slug, _ = self._resolve_markdown_client_context(file_path)
