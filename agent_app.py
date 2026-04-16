@@ -233,6 +233,7 @@ class AgentApp:
         self._stats      = {"found": 0, "processed": 0, "errors": 0}
         self._known_clients: list[str] = []
         self._supervisor_cycle_count = 0
+        self.agent_runtime_sessions: dict[str, dict] = {}
         self._learning_controls = {
             "evaluation_threshold": EVALUATION_THRESHOLD,
             "reasoning_confidence_threshold": REASONING_CONFIDENCE_THRESHOLD,
@@ -262,6 +263,7 @@ class AgentApp:
             "active_tasks": [],
             "task_history": [],
             "agent_utilization": {},
+            "agent_runtime_sessions": {},
             "client_priority_map": {},
             "compute_budget": {
                 "max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE,
@@ -342,6 +344,7 @@ class AgentApp:
             "active_tasks": [],
             "task_history": [],
             "agent_utilization": {},
+            "agent_runtime_sessions": {},
             "client_priority_map": {},
             "compute_budget": {
                 "max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE,
@@ -366,6 +369,7 @@ class AgentApp:
                 "active_tasks": payload.get("active_tasks", []) if isinstance(payload.get("active_tasks", []), list) else [],
                 "task_history": payload.get("task_history", []) if isinstance(payload.get("task_history", []), list) else [],
                 "agent_utilization": payload.get("agent_utilization", {}) if isinstance(payload.get("agent_utilization", {}), dict) else {},
+                "agent_runtime_sessions": payload.get("agent_runtime_sessions", {}) if isinstance(payload.get("agent_runtime_sessions", {}), dict) else {},
                 "client_priority_map": payload.get("client_priority_map", {}) if isinstance(payload.get("client_priority_map", {}), dict) else {},
                 "compute_budget": payload.get("compute_budget", default_runtime["compute_budget"]) if isinstance(payload.get("compute_budget", {}), dict) else dict(default_runtime["compute_budget"]),
                 "execution_mode": str(payload.get("execution_mode", "balanced")).strip().lower(),
@@ -379,6 +383,8 @@ class AgentApp:
             budget = self._system_runtime_state["compute_budget"]
             budget["max_units_per_cycle"] = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
             budget["used_units"] = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
+            sessions = self._system_runtime_state.get("agent_runtime_sessions", {})
+            self.agent_runtime_sessions = sessions if isinstance(sessions, dict) else {}
         except Exception as exc:
             self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
             self._system_runtime_state = default_runtime
@@ -391,6 +397,7 @@ class AgentApp:
             "active_tasks": runtime.get("active_tasks", []) if isinstance(runtime.get("active_tasks", []), list) else [],
             "task_history": runtime.get("task_history", [])[-MAX_TASK_HISTORY_SIZE:] if isinstance(runtime.get("task_history", []), list) else [],
             "agent_utilization": runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {},
+            "agent_runtime_sessions": runtime.get("agent_runtime_sessions", {}) if isinstance(runtime.get("agent_runtime_sessions", {}), dict) else {},
             "client_priority_map": runtime.get("client_priority_map", {}) if isinstance(runtime.get("client_priority_map", {}), dict) else {},
             "compute_budget": runtime.get("compute_budget", {}) if isinstance(runtime.get("compute_budget", {}), dict) else {},
             "execution_mode": str(runtime.get("execution_mode", "balanced")).strip().lower(),
@@ -403,6 +410,17 @@ class AgentApp:
         budget = serialized["compute_budget"]
         budget["max_units_per_cycle"] = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
         budget["used_units"] = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
+        serialized["agent_runtime_sessions"] = {
+            slug: {
+                "client_slug": session.get("client_slug", slug),
+                "created_at": session.get("created_at", ""),
+                "last_accessed_at": session.get("last_accessed_at", ""),
+                "warm_state": bool(session.get("warm_state", False)),
+                "metrics": session.get("metrics", {}),
+            }
+            for slug, session in self.agent_runtime_sessions.items()
+            if isinstance(session, dict)
+        }
         self._system_runtime_state = serialized
         self._system_runtime_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
 
@@ -1045,19 +1063,90 @@ class AgentApp:
         return all(bool(str(client_data.get(field, "")).strip()) for field in required_fields)
 
     def _safe_read_json_dict(self, path: Path, label: str) -> tuple[dict, str]:
+        return self._safe_read_json_dict_from_runtime(path, label, runtime_session=None)
+
+    def _safe_read_json_dict_from_runtime(
+        self,
+        path: Path,
+        label: str,
+        runtime_session: dict | None = None,
+    ) -> tuple[dict, str]:
         if not path.exists():
             return {}, "missing"
+        cache_node = None
+        cache_key = str(path.resolve())
+        if isinstance(runtime_session, dict):
+            cache_node = runtime_session.setdefault("cache", {}).setdefault("loaded_files", {})
+            stat = path.stat()
+            signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+            cached = cache_node.get(cache_key)
+            runtime_session["metrics"]["cache_lookups"] += 1
+            if isinstance(cached, dict) and cached.get("signature") == signature:
+                runtime_session["metrics"]["cache_hits"] += 1
+                return dict(cached.get("data", {})), str(cached.get("status", "ok"))
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 self._log_activity(f"[CONTEXT] ignored {label}: expected object got {type(data).__name__}")
                 return {}, "invalid"
+            if isinstance(runtime_session, dict):
+                runtime_session["metrics"]["disk_reads_saved_candidates"] += 1
+                cache_node[cache_key] = {"signature": signature, "data": data, "status": "ok"}
             return data, "ok"
         except Exception as exc:
             self._log_activity(f"[CONTEXT] ignored {label}: {exc}")
+            if isinstance(runtime_session, dict):
+                cache_node[cache_key] = {"signature": signature, "data": {}, "status": "invalid"}
             return {}, "invalid"
 
+    def _get_or_create_runtime_session(self, client_slug: str) -> dict:
+        slug = str(client_slug or "").strip().lower()
+        if not slug:
+            slug = "__global__"
+        now = datetime.now().isoformat(timespec="seconds")
+        existing = self.agent_runtime_sessions.get(slug)
+        if existing:
+            existing.setdefault("cache", {"loaded_files": {}, "previous_outputs": {}, "intermediate_computations": {}})
+            existing.setdefault("metrics", {})
+            existing["metrics"].setdefault("cache_hits", 0)
+            existing["metrics"].setdefault("cache_lookups", 0)
+            existing["metrics"].setdefault("disk_reads_saved_candidates", 0)
+            existing["metrics"].setdefault("session_efficiency_gain", 0.0)
+            existing["warm_state"] = True
+            existing["last_accessed_at"] = now
+            return existing
+
+        session = {
+            "client_slug": slug,
+            "created_at": now,
+            "last_accessed_at": now,
+            "warm_state": True,
+            "cache": {
+                "loaded_files": {},
+                "previous_outputs": {},
+                "intermediate_computations": {},
+            },
+            "metrics": {
+                "cache_hits": 0,
+                "cache_lookups": 0,
+                "disk_reads_saved_candidates": 0,
+                "session_efficiency_gain": 0.0,
+            },
+        }
+        self.agent_runtime_sessions[slug] = session
+        self._log_activity(f"[RUNTIME] session_created slug={slug} warm_state=true")
+        return session
+
+    def _update_session_efficiency_gain(self, runtime_session: dict) -> None:
+        metrics = runtime_session.get("metrics", {})
+        lookups = max(1, int(metrics.get("cache_lookups", 0)))
+        hits = int(metrics.get("cache_hits", 0))
+        gain = round((hits / lookups) * 100.0, 2)
+        metrics["session_efficiency_gain"] = gain
+        runtime_session["metrics"] = metrics
+
     def _build_client_context(self, slug: str, raw_client_data: dict | None = None) -> dict:
+        runtime_session = self._get_or_create_runtime_session(slug)
         client_root = self.paths["clients"] / slug
         notes_file = client_root / "notes" / "client.json"
         profile_file = client_root / "notes" / "intelligence_profile.json"
@@ -1080,18 +1169,24 @@ class AgentApp:
             profile_data, profile_status = {}, "skipped"
             memory = {}
         else:
-            truth_data, truth_status = self._safe_read_json_dict(notes_file, f"{slug}:notes/client.json")
+            truth_data, truth_status = self._safe_read_json_dict_from_runtime(
+                notes_file,
+                f"{slug}:notes/client.json",
+                runtime_session=runtime_session,
+            )
             if truth_status == "ok":
                 included_sources.append("truth")
                 identity["name"] = str(truth_data.get("name", identity.get("name", ""))).strip()
 
-            profile_data, profile_status = self._safe_read_json_dict(
-                profile_file, f"{slug}:notes/intelligence_profile.json"
+            profile_data, profile_status = self._safe_read_json_dict_from_runtime(
+                profile_file,
+                f"{slug}:notes/intelligence_profile.json",
+                runtime_session=runtime_session,
             )
             if profile_status == "ok":
                 included_sources.append("profile")
 
-            memory = self._load_client_memory(slug)
+            memory = self._load_client_memory(slug, runtime_session=runtime_session)
             included_sources.append("memory")
         evaluation = memory.get("last_evaluation", {})
         stable = bool(memory.get("stable", False))
@@ -1161,7 +1256,7 @@ class AgentApp:
             f"{','.join(f'{k}:{v}' for k, v in sorted(field_sources.items()))}"
         )
 
-        return {
+        context_payload = {
             "slug": slug,
             "identity": identity,
             "truth_data": truth_data,
@@ -1184,7 +1279,14 @@ class AgentApp:
                 "source_signature": source_signature,
             },
             "analysis_input": merged,
+            "runtime": {
+                "warm_state": bool(runtime_session.get("warm_state", False)),
+                "session_efficiency_gain": runtime_session.get("metrics", {}).get("session_efficiency_gain", 0.0),
+            },
         }
+        runtime_session["cache"]["intermediate_computations"]["last_context"] = context_payload
+        self._update_session_efficiency_gain(runtime_session)
+        return context_payload
 
     def _run_local_reasoning(self, client_context: dict, task_type: str) -> dict:
         """
@@ -1362,7 +1464,7 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
 
-    def _load_client_memory(self, slug: str) -> dict:
+    def _load_client_memory(self, slug: str, runtime_session: dict | None = None) -> dict:
         """Load structured memory for a client; return empty shape if unavailable."""
         memory_file = self.paths["clients"] / slug / "memory.json"
         empty_memory = {
@@ -1396,11 +1498,21 @@ class AgentApp:
         }
         if not memory_file.exists():
             return empty_memory
+        cache_key = str(memory_file.resolve())
+        if isinstance(runtime_session, dict):
+            loaded_files = runtime_session.setdefault("cache", {}).setdefault("loaded_files", {})
+            stat = memory_file.stat()
+            signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+            cached = loaded_files.get(cache_key)
+            runtime_session["metrics"]["cache_lookups"] += 1
+            if isinstance(cached, dict) and cached.get("signature") == signature and isinstance(cached.get("data"), dict):
+                runtime_session["metrics"]["cache_hits"] += 1
+                return dict(cached.get("data", empty_memory))
         try:
             data = json.loads(memory_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return empty_memory
-            return {
+            payload = {
                 "last_action_plan": data.get("last_action_plan", []),
                 "execution_results": data.get("execution_results", {}),
                 "generated_fields": data.get("generated_fields", {}),
@@ -1419,6 +1531,10 @@ class AgentApp:
                 "agent_performance": data.get("agent_performance", empty_memory["agent_performance"]),
                 "timestamp": data.get("timestamp", ""),
             }
+            if isinstance(runtime_session, dict):
+                loaded_files[cache_key] = {"signature": signature, "data": payload, "status": "ok"}
+                runtime_session["metrics"]["disk_reads_saved_candidates"] += 1
+            return payload
         except Exception as exc:
             self._log_activity(f"[MEMORY] load failed slug={slug}: {exc}")
             return empty_memory
@@ -1997,6 +2113,7 @@ class AgentApp:
         planned = set(client_analysis.action_plan)
         client_data = client_analysis.to_dict()
         final_slug = client_analysis.slug
+        runtime_session = self._get_or_create_runtime_session(final_slug)
         copied = 0
         context = context or {}
         can_reuse_context_memory = (
@@ -2018,12 +2135,31 @@ class AgentApp:
         execution_results: dict[str, str] = {}
         current_context = dict(context)
         current_context["analysis_input"] = dict(client_data)
+        current_context["runtime_session"] = runtime_session
+        current_context["warm_state"] = bool(runtime_session.get("warm_state", False))
 
-        planner_response = self._run_agent(
-            AGENT_PLANNER,
-            current_context,
-            {"requested_plan": [step for step in ordered_steps if step in planned]},
+        previous_outputs = runtime_session.setdefault("cache", {}).setdefault("previous_outputs", {})
+        planner_cache_key = json.dumps(
+            {
+                "role": AGENT_PLANNER,
+                "requested_plan": [step for step in ordered_steps if step in planned],
+                "analysis_input": current_context.get("analysis_input", {}),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
         )
+        runtime_session["metrics"]["cache_lookups"] += 1
+        planner_response = previous_outputs.get(planner_cache_key)
+        if isinstance(planner_response, dict):
+            runtime_session["metrics"]["cache_hits"] += 1
+        else:
+            planner_response = self._run_agent(
+                AGENT_PLANNER,
+                current_context,
+                {"requested_plan": [step for step in ordered_steps if step in planned]},
+            )
+            previous_outputs[planner_cache_key] = planner_response
+
         planner_steps = planner_response.get("output", {}).get("selected_steps", [])
         planned = set(planner_steps if isinstance(planner_steps, list) else [])
         planner_accepted = bool(planned)
@@ -2319,12 +2455,15 @@ class AgentApp:
             action_plan=client_analysis.action_plan,
         )
 
+        self._update_session_efficiency_gain(runtime_session)
         return {
             "analysis": updated_analysis,
             "client_data": client_data,
             "client_root": self.paths["clients"] / final_slug,
             "copied": copied,
             "execution_results": execution_results,
+            "warm_state": bool(runtime_session.get("warm_state", False)),
+            "session_efficiency_gain": runtime_session.get("metrics", {}).get("session_efficiency_gain", 0.0),
         }
 
     def _propose_actions(self, client_context: dict) -> dict:
