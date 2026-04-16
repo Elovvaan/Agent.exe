@@ -53,6 +53,10 @@ REASONING_CONFIDENCE_THRESHOLD = 0.7
 SYSTEM_LEARNING_INTERVAL_CYCLES = 10
 MAX_TASK_HISTORY_SIZE = 300
 DEFAULT_MAX_UNITS_PER_CYCLE = 100
+FORCED_PROGRESS_CYCLE_THRESHOLD = 3
+FORCED_PROGRESS_VALUE_THRESHOLD_SCALE = 0.75
+FORCED_PROGRESS_COST_TOLERANCE_SCALE = 1.35
+FORCED_PROGRESS_MAX_EXPLORATORY_TASKS = 2
 
 EXECUTION_MODE_CONFIG = {
     "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
@@ -261,6 +265,8 @@ class AgentApp:
             },
             "execution_mode": "balanced",
             "cycle_history": [],
+            "cycles_since_progress": 0,
+            "last_goal_completion_time": "",
         }
         self._task_round_robin_cursor = 0
 
@@ -339,6 +345,8 @@ class AgentApp:
             },
             "execution_mode": "balanced",
             "cycle_history": [],
+            "cycles_since_progress": 0,
+            "last_goal_completion_time": "",
         }
         runtime_file = self._system_runtime_file()
         if not runtime_file.exists():
@@ -358,6 +366,8 @@ class AgentApp:
                 "compute_budget": payload.get("compute_budget", default_runtime["compute_budget"]) if isinstance(payload.get("compute_budget", {}), dict) else dict(default_runtime["compute_budget"]),
                 "execution_mode": str(payload.get("execution_mode", "balanced")).strip().lower(),
                 "cycle_history": payload.get("cycle_history", []) if isinstance(payload.get("cycle_history", []), list) else [],
+                "cycles_since_progress": max(0, int(payload.get("cycles_since_progress", 0))),
+                "last_goal_completion_time": str(payload.get("last_goal_completion_time", "")).strip(),
             }
             mode = self._system_runtime_state["execution_mode"]
             if mode not in EXECUTION_MODE_CONFIG:
@@ -381,6 +391,8 @@ class AgentApp:
             "compute_budget": runtime.get("compute_budget", {}) if isinstance(runtime.get("compute_budget", {}), dict) else {},
             "execution_mode": str(runtime.get("execution_mode", "balanced")).strip().lower(),
             "cycle_history": runtime.get("cycle_history", [])[-80:] if isinstance(runtime.get("cycle_history", []), list) else [],
+            "cycles_since_progress": max(0, int(runtime.get("cycles_since_progress", 0))),
+            "last_goal_completion_time": str(runtime.get("last_goal_completion_time", "")).strip(),
         }
         if serialized["execution_mode"] not in EXECUTION_MODE_CONFIG:
             serialized["execution_mode"] = "balanced"
@@ -2828,6 +2840,23 @@ class AgentApp:
         used_units = max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0))
         return max(0.0, round(max_units - used_units, 3))
 
+    def _forced_progress_state(self, runtime: dict) -> dict:
+        cycles = max(0, int(runtime.get("cycles_since_progress", 0)))
+        threshold = max(1, int(runtime.get("forced_progress_threshold", FORCED_PROGRESS_CYCLE_THRESHOLD)))
+        active = cycles > threshold
+        exploratory_slots = 0
+        if active:
+            exploratory_slots = min(
+                FORCED_PROGRESS_MAX_EXPLORATORY_TASKS,
+                max(1, cycles - threshold),
+            )
+        return {
+            "cycles_since_progress": cycles,
+            "threshold": threshold,
+            "active": active,
+            "exploratory_slots": exploratory_slots,
+        }
+
     def _estimate_task_cost(self, task: dict) -> dict:
         plan = task.get("plan", {}) if isinstance(task.get("plan", {}), dict) else {}
         progress = task.get("progress", {}) if isinstance(task.get("progress", {}), dict) else {}
@@ -2902,8 +2931,9 @@ class AgentApp:
         )
         runtime.setdefault("agent_utilization", {})
 
-    def _should_execute_task(self, task: dict, goal: dict, runtime: dict) -> dict:
+    def _should_execute_task(self, task: dict, goal: dict, runtime: dict, forced_progress: dict | None = None) -> dict:
         config = self._execution_config(runtime)
+        forced = forced_progress if isinstance(forced_progress, dict) else {"active": False, "exploratory_slots": 0}
         cost = self._estimate_task_cost(task)
         value_score = self._estimate_task_value(task, goal)
         task["cost_estimate"] = cost
@@ -2932,16 +2962,27 @@ class AgentApp:
             return {"decision": "defer", "reason": "requires_optimizer_intervention"}
 
         threshold = float(config.get("value_threshold", 0.45))
-        if value_score < threshold:
+        effective_threshold = threshold
+        if forced.get("active", False):
+            effective_threshold = max(0.05, threshold * FORCED_PROGRESS_VALUE_THRESHOLD_SCALE)
+
+        exploration_eligible = forced.get("active", False) and int(forced.get("exploratory_slots", 0)) > 0
+        if value_score < effective_threshold:
+            if exploration_eligible and value_score >= max(0.05, effective_threshold - 0.2):
+                return {"decision": "execute", "reason": "forced_progress_exploration", "exploration_tasks": True}
             return {"decision": "skip", "reason": "low_value"}
 
         remaining_budget = self._remaining_budget(runtime)
         adjusted_cost = cost["estimated_units"] * float(config.get("cost_multiplier", 1.0))
+        if forced.get("active", False):
+            adjusted_cost = adjusted_cost / FORCED_PROGRESS_COST_TOLERANCE_SCALE
         if adjusted_cost > remaining_budget:
             goal_priority = self._safe_float(goal.get("priority", goal.get("priority_score", 0.0)), 0.0)
             allow_override = bool(config.get("allow_budget_override", False))
             if allow_override and goal_priority >= 9.0 and value_score >= 0.8:
                 return {"decision": "prioritize", "reason": "aggressive_budget_override"}
+            if exploration_eligible:
+                return {"decision": "execute", "reason": "forced_progress_budget_exploration", "exploration_tasks": True}
             return {"decision": "defer", "reason": "budget_exceeded"}
 
         if value_score >= min(0.95, threshold + 0.25) and adjusted_cost <= max(4.0, remaining_budget * 0.25):
@@ -2952,9 +2993,11 @@ class AgentApp:
         skipped: list[dict] = []
         filtered: list[dict] = []
         deferred: list[dict] = []
+        forced_progress = self._forced_progress_state(runtime)
+        runtime["forced_progress_active"] = forced_progress["active"]
         for task in tasks:
             goal = goals_by_id.get(str(task.get("goal_id", "")), {})
-            decision = self._should_execute_task(task, goal, runtime)
+            decision = self._should_execute_task(task, goal, runtime, forced_progress)
             task["execution_decision"] = decision
             if decision["decision"] == "skip":
                 task["status"] = TASK_STATUS_FAILED
@@ -2968,6 +3011,9 @@ class AgentApp:
                 continue
             if decision["decision"] == "prioritize":
                 task["priority_score"] = round(self._safe_float(task.get("priority_score", 0.0), 0.0) + 500.0, 3)
+            task["exploration_tasks"] = bool(decision.get("exploration_tasks", False))
+            if task["exploration_tasks"] and forced_progress["exploratory_slots"] > 0:
+                forced_progress["exploratory_slots"] -= 1
             filtered.append(task)
 
         max_concurrent = max(1, int(runtime.get("max_concurrent_tasks", 5)))
@@ -2977,6 +3023,15 @@ class AgentApp:
         )
         selected = ordered[:max_concurrent]
         queued = ordered[max_concurrent:] + deferred
+        if not selected and queued and forced_progress["active"]:
+            fallback = queued.pop(0)
+            fallback["exploration_tasks"] = True
+            fallback["execution_decision"] = {
+                "decision": "execute",
+                "reason": "forced_progress_no_stall",
+                "exploration_tasks": True,
+            }
+            selected.append(fallback)
         if not queued or not selected:
             return selected, queued, skipped
 
@@ -3172,6 +3227,8 @@ class AgentApp:
 
         runtime = self._load_system_runtime()
         runtime["agent_utilization"] = runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {}
+        progress_advanced = False
+        goal_completion_recorded = False
         tasks: list[dict] = []
         goals_by_id: dict[str, dict] = {}
         created_at = datetime.now().isoformat(timespec="seconds")
@@ -3194,6 +3251,7 @@ class AgentApp:
             now = datetime.now().isoformat(timespec="seconds")
 
             if progress["complete"]:
+                goal_completion_recorded = True
                 self._update_goal_record(
                     goal_id,
                     {
@@ -3213,6 +3271,7 @@ class AgentApp:
                     rejected=False,
                 )
                 self._persist_system_learning_state()
+                runtime["last_goal_completion_time"] = now
                 self._log_activity(f"[GOAL] completed goal_id={goal_id} slug={slug} score={progress['current_score']:.2f}")
                 continue
 
@@ -3310,28 +3369,53 @@ class AgentApp:
                 status = GOAL_STATUS_BLOCKED if task["progress"].get("blocked", False) else status
 
             now = datetime.now().isoformat(timespec="seconds")
+            post_run_progress = task["progress"]
+            if slug:
+                after_evaluation = self._evaluate_client_state(slug)
+                self._persist_client_evaluation(slug, after_evaluation)
+                after_context = self._build_client_context(slug)
+                after_context["evaluation"] = after_evaluation
+                post_run_progress = self._evaluate_goal_progress(goals_by_id.get(task["goal_id"], {}), after_context)
+            progress_improved = self._safe_float(post_run_progress.get("current_score", 0.0), 0.0) > self._safe_float(task["progress"].get("current_score", 0.0), 0.0)
+            if progress_improved:
+                progress_advanced = True
+
+            if task.get("exploration_tasks", False):
+                task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+                efficiency = self._system_learning_state.setdefault("task_efficiency", {})
+                stats = efficiency.setdefault(task_type, {}) if isinstance(efficiency, dict) else {}
+                if isinstance(stats, dict):
+                    if progress_improved:
+                        stats["value_return"] = round(min(1.0, self._safe_float(stats.get("value_return", 0.5), 0.5) + 0.05), 3)
+                        self._log_activity(f"[TASK] exploration_feedback task_id={task['task_id']} improved=true action=reinforce_pattern")
+                    else:
+                        stats["value_return"] = round(max(0.0, self._safe_float(stats.get("value_return", 0.5), 0.5) - 0.04), 3)
+                        task["priority_score"] = round(max(0.0, self._safe_float(task.get("priority_score", 0.0), 0.0) * 0.9), 3)
+                        self._log_activity(f"[TASK] exploration_feedback task_id={task['task_id']} improved=false action=decay_priority")
+
             self._update_goal_record(
                 task["goal_id"],
                 {
-                    "progress": task["progress"]["progress_percent"],
+                    "progress": post_run_progress["progress_percent"],
                     "status": status,
-                    "blocked": task["progress"]["blocked"],
+                    "blocked": post_run_progress["blocked"],
                     "last_run": now,
                     "completion_state": completion_state,
+                    "exploration_tasks": bool(task.get("exploration_tasks", False)),
                     "last_evaluation": {
-                        "current_score": task["progress"]["current_score"],
-                        "target_score": task["progress"]["target_score"],
-                        "score_gap": task["progress"]["score_gap"],
-                        "unresolved_issues": task["progress"]["unresolved_issues"],
-                        "action_history_effectiveness": task["progress"]["action_history_effectiveness"],
+                        "current_score": post_run_progress["current_score"],
+                        "target_score": post_run_progress["target_score"],
+                        "score_gap": post_run_progress["score_gap"],
+                        "unresolved_issues": post_run_progress["unresolved_issues"],
+                        "action_history_effectiveness": post_run_progress["action_history_effectiveness"],
                     },
                     "last_plan": task["plan"],
                     "last_result": run_result,
                 },
             )
             self._log_activity(
-                f"[GOAL] cycle goal_id={task['goal_id']} slug={slug} progress={task['progress']['progress_percent']} "
-                f"blocked={task['progress']['blocked']} result={run_result} "
+                f"[GOAL] cycle goal_id={task['goal_id']} slug={slug} progress={post_run_progress['progress_percent']} "
+                f"blocked={post_run_progress['blocked']} result={run_result} "
                 f"tier={task['plan'].get('escalation', {}).get('tier', 'standard')}"
             )
 
@@ -3357,6 +3441,12 @@ class AgentApp:
                 f"[TASK] complete task_id={task['task_id']} status={completion['status']} "
                 f"units={compute_units['total']:.3f}"
             )
+
+        if goal_completion_recorded or progress_advanced:
+            runtime["cycles_since_progress"] = 0
+        else:
+            runtime["cycles_since_progress"] = max(0, int(runtime.get("cycles_since_progress", 0))) + 1
+        self._persist_system_runtime(runtime)
 
     def _evaluate_and_prioritize_clients(self) -> None:
         clients = self._discover_clients()
