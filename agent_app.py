@@ -1105,13 +1105,23 @@ class AgentApp:
             slug = "__global__"
         now = datetime.now().isoformat(timespec="seconds")
         existing = self.agent_runtime_sessions.get(slug)
-        if existing:
-            existing.setdefault("cache", {"loaded_files": {}, "previous_outputs": {}, "intermediate_computations": {}})
-            existing.setdefault("metrics", {})
-            existing["metrics"].setdefault("cache_hits", 0)
-            existing["metrics"].setdefault("cache_lookups", 0)
-            existing["metrics"].setdefault("disk_reads_saved_candidates", 0)
-            existing["metrics"].setdefault("session_efficiency_gain", 0.0)
+        if isinstance(existing, dict):
+            cache = existing.get("cache")
+            if not isinstance(cache, dict):
+                cache = {}
+                existing["cache"] = cache
+            for cache_key in ("loaded_files", "previous_outputs", "intermediate_computations"):
+                if not isinstance(cache.get(cache_key), dict):
+                    cache[cache_key] = {}
+
+            metrics = existing.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+                existing["metrics"] = metrics
+            metrics.setdefault("cache_hits", 0)
+            metrics.setdefault("cache_lookups", 0)
+            metrics.setdefault("disk_reads_saved_candidates", 0)
+            metrics.setdefault("session_efficiency_gain", 0.0)
             existing["warm_state"] = True
             existing["last_accessed_at"] = now
             return existing
