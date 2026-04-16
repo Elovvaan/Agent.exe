@@ -76,6 +76,7 @@ Then open **Artifacts** → `Agent-windows-bundle`.
 
 ## 6) Runtime behavior
 - **New Client** creates `clients/{client-name}/assets`, `site`, and `notes/client.json`.
+- New client folders also include `notes/intelligence_profile.json` for per-client default behavior.
 - **Open Client** selects client from SSD `clients/`.
 - **Generate Site** reads `templates/base-site` and writes to `clients/{client-name}/site`.
 - **Preview Site** opens `clients/{client-name}/site/index.html`.
@@ -85,6 +86,7 @@ Then open **Artifacts** → `Agent-windows-bundle`.
 ## 7) Support files
 - `agent_app.py`
 - `config.json`
+- `clients/.gitkeep`
 - `templates/base-site/*`
 
 ## 8) Phase 13: Internal multi-agent specialization
