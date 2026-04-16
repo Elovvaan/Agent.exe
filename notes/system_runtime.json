@@ -1,0 +1,7 @@
+{
+  "max_concurrent_tasks": 5,
+  "active_tasks": [],
+  "task_history": [],
+  "agent_utilization": {},
+  "client_priority_map": {}
+}

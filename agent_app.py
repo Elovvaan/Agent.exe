@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from dataclasses import dataclass
@@ -82,6 +83,10 @@ GOAL_STATUS_ACTIVE = "active"
 GOAL_STATUS_COMPLETED = "completed"
 GOAL_STATUS_BLOCKED = "blocked"
 GOAL_FAILURE_ESCALATION_THRESHOLD = 2
+TASK_STATUS_PENDING = "pending"
+TASK_STATUS_RUNNING = "running"
+TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_FAILED = "failed"
 DEFAULT_ACTION_POLICY = {
     "allowed_actions": [ACTION_FILE_WRITE, ACTION_NO_OP],
     "allowed_domains": [],
@@ -235,9 +240,18 @@ class AgentApp:
             "system_score_trend": [],
             "agent_learning_signals": [],
         }
+        self._system_runtime_state = {
+            "max_concurrent_tasks": 5,
+            "active_tasks": [],
+            "task_history": [],
+            "agent_utilization": {},
+            "client_priority_map": {},
+        }
+        self._task_round_robin_cursor = 0
 
         self._ensure_core_structure()
         self._load_system_learning_state()
+        self._load_system_runtime()
         self._build_ui()
         self.refresh_client_list()
 
@@ -290,9 +304,72 @@ class AgentApp:
     def _system_goals_file(self) -> Path:
         return self.paths["notes"] / "system_goals.json"
 
+    def _system_runtime_file(self) -> Path:
+        return self.paths["notes"] / "system_runtime.json"
+
     def _persist_system_goals(self, payload: dict) -> None:
         serialized = payload if isinstance(payload, dict) else {"active_goals": []}
         self._system_goals_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+
+    def _load_system_runtime(self) -> dict:
+        default_runtime = {
+            "max_concurrent_tasks": 5,
+            "active_tasks": [],
+            "task_history": [],
+            "agent_utilization": {},
+            "client_priority_map": {},
+        }
+        runtime_file = self._system_runtime_file()
+        if not runtime_file.exists():
+            self._system_runtime_state = default_runtime
+            self._persist_system_runtime(self._system_runtime_state)
+            return self._system_runtime_state
+        try:
+            payload = json.loads(runtime_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+            self._system_runtime_state = {
+                "max_concurrent_tasks": max(1, int(payload.get("max_concurrent_tasks", 5))),
+                "active_tasks": payload.get("active_tasks", []) if isinstance(payload.get("active_tasks", []), list) else [],
+                "task_history": payload.get("task_history", []) if isinstance(payload.get("task_history", []), list) else [],
+                "agent_utilization": payload.get("agent_utilization", {}) if isinstance(payload.get("agent_utilization", {}), dict) else {},
+                "client_priority_map": payload.get("client_priority_map", {}) if isinstance(payload.get("client_priority_map", {}), dict) else {},
+            }
+        except Exception as exc:
+            self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
+            self._system_runtime_state = default_runtime
+        return self._system_runtime_state
+
+    def _persist_system_runtime(self, payload: dict | None = None) -> None:
+        runtime = payload if isinstance(payload, dict) else self._system_runtime_state
+        serialized = {
+            "max_concurrent_tasks": max(1, int(runtime.get("max_concurrent_tasks", 5))),
+            "active_tasks": runtime.get("active_tasks", []) if isinstance(runtime.get("active_tasks", []), list) else [],
+            "task_history": runtime.get("task_history", [])[-300:] if isinstance(runtime.get("task_history", []), list) else [],
+            "agent_utilization": runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {},
+            "client_priority_map": runtime.get("client_priority_map", {}) if isinstance(runtime.get("client_priority_map", {}), dict) else {},
+        }
+        self._system_runtime_state = serialized
+        self._system_runtime_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+
+    def _create_agent_pool(self, max_concurrent_tasks: int) -> dict[str, int]:
+        capacity = max(1, int(max_concurrent_tasks))
+        per_role = max(1, capacity // 4)
+        pool = {
+            "planner": per_role,
+            "generator": per_role,
+            "evaluator": per_role,
+            "optimizer": per_role,
+        }
+        remainder = max(0, capacity - sum(pool.values()))
+        ordered_roles = ["planner", "generator", "evaluator", "optimizer"]
+        idx = 0
+        while remainder > 0:
+            role = ordered_roles[idx % len(ordered_roles)]
+            pool[role] += 1
+            remainder -= 1
+            idx += 1
+        return pool
 
     def _load_active_goals(self) -> list[dict]:
         goals_file = self._system_goals_file()
@@ -1244,6 +1321,13 @@ class AgentApp:
             "last_context_summary": {},
             "reasoning_history": {},
             "action_history": [],
+            "task_history": [],
+            "compute_units_used": {
+                "total": 0.0,
+                "reasoning_calls": 0,
+                "generations": 0,
+                "execution_seconds": 0.0,
+            },
             "agent_performance": {
                 "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
                 "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
@@ -1272,6 +1356,8 @@ class AgentApp:
                 "last_context_summary": data.get("last_context_summary", {}),
                 "reasoning_history": data.get("reasoning_history", {}),
                 "action_history": data.get("action_history", []),
+                "task_history": data.get("task_history", []),
+                "compute_units_used": data.get("compute_units_used", empty_memory["compute_units_used"]),
                 "agent_performance": data.get("agent_performance", empty_memory["agent_performance"]),
                 "timestamp": data.get("timestamp", ""),
             }
@@ -1299,6 +1385,13 @@ class AgentApp:
             "last_context_summary": data.get("last_context_summary", existing.get("last_context_summary", {})),
             "reasoning_history": data.get("reasoning_history", existing.get("reasoning_history", {})),
             "action_history": data.get("action_history", existing.get("action_history", [])),
+            "task_history": data.get("task_history", existing.get("task_history", [])),
+            "compute_units_used": data.get("compute_units_used", existing.get("compute_units_used", {
+                "total": 0.0,
+                "reasoning_calls": 0,
+                "generations": 0,
+                "execution_seconds": 0.0,
+            })),
             "agent_performance": data.get("agent_performance", existing.get("agent_performance", {
                 "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
                 "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
@@ -1783,12 +1876,12 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
 
-    def _schedule_client_supervisor_work(self, slug: str, reason: str) -> None:
+    def _schedule_client_supervisor_work(self, slug: str, reason: str) -> dict:
         client_root = self.paths["clients"] / slug
         notes_file = client_root / "notes" / "client.json"
         if not notes_file.exists():
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} skipped=missing_notes")
-            return
+            return {"status": "skipped", "execution_results": {}}
         try:
             raw_data = json.loads(notes_file.read_text(encoding="utf-8"))
             raw_data["overwrite"] = True
@@ -1814,8 +1907,14 @@ class AgentApp:
             self._update_client_memory(final_analysis.slug, memory)
             self._process_external_actions(final_analysis.slug, final_analysis, execution_results)
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=processed")
+            return {
+                "status": "processed",
+                "analysis": final_analysis,
+                "execution_results": execution_results,
+            }
         except Exception as exc:
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=failed error={exc}")
+            return {"status": "failed", "error": str(exc), "execution_results": {}}
 
     def _execute_action_plan(self, client_analysis: ClientAnalysis, context: dict | None = None) -> dict:
         """
@@ -2634,11 +2733,169 @@ class AgentApp:
         except Exception as exc:
             self._log_activity(f"[GOAL] failed_to_update_goal_record goal_id={goal_id} error={exc}")
 
+    def _score_task_priority(self, goal: dict, client_context: dict) -> float:
+        slug = str(goal.get("client_slug", "")).strip()
+        evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
+        memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
+        target_state = goal.get("target_state", {}) if isinstance(goal.get("target_state", {}), dict) else {}
+        current_score = self._safe_float(evaluation.get("overall_score", 0.0), 0.0)
+        target_score = self._safe_float(target_state.get("overall_score", 0.9), 0.9)
+        score_gap = max(0.0, target_score - current_score)
+        goal_priority = self._safe_float(goal.get("priority", goal.get("priority_score", 5)), 5.0)
+        failures = int(goal.get("failure_count", 0))
+        if failures <= 0:
+            execution_results = memory.get("execution_results", {})
+            if isinstance(execution_results, dict):
+                failures = sum(1 for status in execution_results.values() if status == "failed")
+        client_priority = self._safe_float(self._system_runtime_state.get("client_priority_map", {}).get(slug, 0), 0.0)
+        return round((goal_priority * 4.0) + (score_gap * 10.0) + (failures * 2.0) + (client_priority * 3.0), 3)
+
+    def _schedule_tasks(self, tasks: list[dict], runtime: dict) -> tuple[list[dict], list[dict]]:
+        max_concurrent = max(1, int(runtime.get("max_concurrent_tasks", 5)))
+        ordered = sorted(
+            tasks,
+            key=lambda item: (-self._safe_float(item.get("priority_score", 0.0), 0.0), str(item.get("created_at", ""))),
+        )
+        selected = ordered[:max_concurrent]
+        queued = ordered[max_concurrent:]
+        if not queued or not selected:
+            return selected, queued
+
+        represented_clients = {str(task.get("client_slug", "")) for task in selected}
+        all_clients = [str(task.get("client_slug", "")) for task in ordered if str(task.get("client_slug", ""))]
+        unique_clients = list(dict.fromkeys(all_clients))
+        missing_clients = [slug for slug in unique_clients if slug not in represented_clients]
+        if not missing_clients:
+            return selected, queued
+
+        fallback_slug = missing_clients[self._task_round_robin_cursor % len(missing_clients)]
+        self._task_round_robin_cursor += 1
+        queued_index = next((idx for idx, task in enumerate(queued) if task.get("client_slug") == fallback_slug), -1)
+        if queued_index < 0:
+            return selected, queued
+        fallback_task = queued.pop(queued_index)
+        selected.append(fallback_task)
+        selected = sorted(
+            selected,
+            key=lambda item: self._safe_float(item.get("priority_score", 0.0), 0.0),
+        )[1:]
+        return selected, queued
+
+    def _assign_agent(self, task: dict, runtime: dict) -> str:
+        pool = self._create_agent_pool(int(runtime.get("max_concurrent_tasks", 5)))
+        utilization = runtime.setdefault("agent_utilization", {})
+        for role in ("planner", "generator", "evaluator", "optimizer"):
+            utilization[role] = int(utilization.get(role, 0))
+
+        preferred = "planner"
+        next_actions = task.get("next_needed_actions", []) if isinstance(task.get("next_needed_actions", []), list) else []
+        if task.get("repeated_failure", False):
+            preferred = "optimizer"
+        elif any(action in {"improve_quality_score", "resolve_unresolved_issues"} for action in next_actions):
+            preferred = "generator"
+        elif task.get("score_gap", 0.0) <= 0.1:
+            preferred = "evaluator"
+
+        if utilization.get(preferred, 0) < pool.get(preferred, 0):
+            task["assigned_agent"] = preferred
+            return preferred
+
+        available = [role for role in pool if utilization.get(role, 0) < pool.get(role, 0)]
+        if not available:
+            task["assigned_agent"] = ""
+            return ""
+        available.sort(key=lambda role: utilization.get(role, 0) / max(1, pool.get(role, 1)))
+        task["assigned_agent"] = available[0]
+        return available[0]
+
+    def _log_task_start(self, task: dict, runtime: dict) -> bool:
+        active_tasks = runtime.get("active_tasks", [])
+        if not isinstance(active_tasks, list):
+            active_tasks = []
+        max_concurrent = max(1, int(runtime.get("max_concurrent_tasks", 5)))
+        if len(active_tasks) >= max_concurrent:
+            runtime["active_tasks"] = active_tasks
+            self._persist_system_runtime(runtime)
+            return False
+        started = dict(task)
+        started["status"] = TASK_STATUS_RUNNING
+        started["started_at"] = datetime.now().isoformat(timespec="seconds")
+        active_tasks.append(started)
+        runtime["active_tasks"] = active_tasks[-max_concurrent:]
+        role = str(started.get("assigned_agent", "")).strip()
+        if role:
+            utilization = runtime.setdefault("agent_utilization", {})
+            utilization[role] = int(utilization.get(role, 0)) + 1
+        self._persist_system_runtime(runtime)
+        return True
+
+    def _log_task_complete(self, task: dict, result: dict, runtime: dict) -> None:
+        task_id = str(task.get("task_id", ""))
+        active_tasks = runtime.get("active_tasks", [])
+        if not isinstance(active_tasks, list):
+            active_tasks = []
+        runtime["active_tasks"] = [
+            entry for entry in active_tasks
+            if not (isinstance(entry, dict) and str(entry.get("task_id", "")) == task_id)
+        ]
+        role = str(task.get("assigned_agent", "")).strip()
+        utilization = runtime.setdefault("agent_utilization", {})
+        if role:
+            utilization[role] = max(0, int(utilization.get(role, 0)) - 1)
+
+        history = runtime.get("task_history", [])
+        if not isinstance(history, list):
+            history = []
+        finalized = dict(task)
+        finalized["status"] = TASK_STATUS_COMPLETED if result.get("status") == "success" else TASK_STATUS_FAILED
+        finalized["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        finalized["result"] = result
+        history.append(finalized)
+        runtime["task_history"] = history[-300:]
+        self._persist_system_runtime(runtime)
+
+        slug = str(task.get("client_slug", "")).strip()
+        if not slug:
+            return
+        memory = self._load_client_memory(slug)
+        task_history = memory.get("task_history", [])
+        if not isinstance(task_history, list):
+            task_history = []
+        task_history.append(
+            {
+                "task_id": task_id,
+                "goal_id": task.get("goal_id", ""),
+                "status": finalized["status"],
+                "assigned_agent": role,
+                "completed_at": finalized["completed_at"],
+                "compute_units_used": result.get("compute_units_used", {}),
+            }
+        )
+        memory["task_history"] = task_history[-120:]
+        compute = memory.get("compute_units_used", {})
+        if not isinstance(compute, dict):
+            compute = {}
+        units = result.get("compute_units_used", {}) if isinstance(result.get("compute_units_used", {}), dict) else {}
+        compute["total"] = round(float(compute.get("total", 0.0)) + self._safe_float(units.get("total", 0.0), 0.0), 3)
+        compute["reasoning_calls"] = int(compute.get("reasoning_calls", 0)) + int(units.get("reasoning_calls", 0))
+        compute["generations"] = int(compute.get("generations", 0)) + int(units.get("generations", 0))
+        compute["execution_seconds"] = round(
+            float(compute.get("execution_seconds", 0.0)) + self._safe_float(units.get("execution_seconds", 0.0), 0.0),
+            3,
+        )
+        memory["compute_units_used"] = compute
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
+
     def _run_goal_supervisor_cycle(self) -> None:
         active_goals = self._load_active_goals()
         if not active_goals:
             return
 
+        runtime = self._load_system_runtime()
+        runtime["agent_utilization"] = runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {}
+        tasks: list[dict] = []
+        created_at = datetime.now().isoformat(timespec="seconds")
         for goal in active_goals:
             goal_id = str(goal.get("goal_id", ""))
             slug = str(goal.get("client_slug", "")).strip()
@@ -2680,49 +2937,124 @@ class AgentApp:
                 continue
 
             plan = self._plan_goal_actions(goal, client_context, progress)
+            reason = (
+                f"goal_id={goal_id};objective={goal.get('objective', '')};"
+                f"progress={progress['progress_percent']};blocked={progress['blocked']};"
+                f"actions={','.join(progress.get('next_needed_actions', [])) or 'none'}"
+            )
+            task = {
+                "task_id": f"{goal_id or slug}-{created_at}",
+                "client_slug": slug,
+                "goal_id": goal_id,
+                "priority_score": self._score_task_priority(goal, client_context),
+                "status": TASK_STATUS_PENDING,
+                "assigned_agent": "",
+                "created_at": created_at,
+                "reason": reason,
+                "plan": plan,
+                "progress": progress,
+                "next_needed_actions": progress.get("next_needed_actions", []),
+                "repeated_failure": progress.get("repeated_failure", False),
+                "score_gap": progress.get("score_gap", 0.0),
+            }
+            tasks.append(task)
+
+        runnable, queued = self._schedule_tasks(tasks, runtime)
+        for task in queued:
+            task["status"] = TASK_STATUS_PENDING
+            self._log_activity(
+                f"[TASK] queued task_id={task['task_id']} goal_id={task['goal_id']} "
+                f"slug={task['client_slug']} priority={task['priority_score']:.2f}"
+            )
+
+        for task in runnable:
+            assigned = self._assign_agent(task, runtime)
+            if not assigned:
+                self._log_activity(f"[TASK] queued task_id={task['task_id']} reason=agent_pool_saturated")
+                continue
+            if not self._log_task_start(task, runtime):
+                self._log_activity(f"[TASK] queued task_id={task['task_id']} reason=concurrency_cap")
+                continue
+            self._log_activity(
+                f"[TASK] start task_id={task['task_id']} goal_id={task['goal_id']} slug={task['client_slug']} "
+                f"priority={task['priority_score']:.2f} agent={assigned}"
+            )
+            slug = str(task.get("client_slug", "")).strip()
+            before_memory = self._load_client_memory(slug) if slug else {}
+            before_reasoning = int(before_memory.get("reasoning_history", {}).get("total_calls", 0)) if isinstance(before_memory.get("reasoning_history", {}), dict) else 0
+            started = time.perf_counter()
             status = GOAL_STATUS_ACTIVE
             completion_state = "in_progress"
             run_result = "planned"
             try:
-                reason = (
-                    f"goal_id={goal_id};objective={goal.get('objective', '')};"
-                    f"progress={progress['progress_percent']};blocked={progress['blocked']};"
-                    f"actions={','.join(progress.get('next_needed_actions', [])) or 'none'}"
-                )
-                self._schedule_client_supervisor_work(slug, reason)
-                run_result = "executed"
+                execution = self._schedule_client_supervisor_work(slug, task.get("reason", "goal_supervisor"))
+                if execution.get("status") == "processed":
+                    run_result = "executed"
+                elif execution.get("status") == "skipped":
+                    run_result = "skipped"
+                    status = GOAL_STATUS_BLOCKED
+                    completion_state = "execution_skipped"
+                else:
+                    run_result = f"failed:{execution.get('error', 'unknown_error')}"
+                    status = GOAL_STATUS_BLOCKED if task["progress"].get("blocked", False) else GOAL_STATUS_ACTIVE
+                    completion_state = "execution_failed"
             except Exception as exc:
                 run_result = f"failed:{exc}"
-                status = GOAL_STATUS_BLOCKED if progress.get("blocked", False) else GOAL_STATUS_ACTIVE
+                status = GOAL_STATUS_BLOCKED if task["progress"].get("blocked", False) else GOAL_STATUS_ACTIVE
                 completion_state = "execution_failed"
-                self._log_activity(f"[GOAL] execution_failed goal_id={goal_id} slug={slug} error={exc}")
+                self._log_activity(f"[GOAL] execution_failed goal_id={task['goal_id']} slug={slug} error={exc}")
 
-            if progress.get("repeated_failure", False):
+            if task["progress"].get("repeated_failure", False):
                 completion_state = "escalated_recovery"
-                status = GOAL_STATUS_BLOCKED if progress.get("blocked", False) else status
+                status = GOAL_STATUS_BLOCKED if task["progress"].get("blocked", False) else status
 
+            now = datetime.now().isoformat(timespec="seconds")
             self._update_goal_record(
-                goal_id,
+                task["goal_id"],
                 {
-                    "progress": progress["progress_percent"],
+                    "progress": task["progress"]["progress_percent"],
                     "status": status,
-                    "blocked": progress["blocked"],
+                    "blocked": task["progress"]["blocked"],
                     "last_run": now,
                     "completion_state": completion_state,
                     "last_evaluation": {
-                        "current_score": progress["current_score"],
-                        "target_score": progress["target_score"],
-                        "score_gap": progress["score_gap"],
-                        "unresolved_issues": progress["unresolved_issues"],
-                        "action_history_effectiveness": progress["action_history_effectiveness"],
+                        "current_score": task["progress"]["current_score"],
+                        "target_score": task["progress"]["target_score"],
+                        "score_gap": task["progress"]["score_gap"],
+                        "unresolved_issues": task["progress"]["unresolved_issues"],
+                        "action_history_effectiveness": task["progress"]["action_history_effectiveness"],
                     },
-                    "last_plan": plan,
+                    "last_plan": task["plan"],
                     "last_result": run_result,
                 },
             )
             self._log_activity(
-                f"[GOAL] cycle goal_id={goal_id} slug={slug} progress={progress['progress_percent']} "
-                f"blocked={progress['blocked']} result={run_result} tier={plan.get('escalation', {}).get('tier', 'standard')}"
+                f"[GOAL] cycle goal_id={task['goal_id']} slug={slug} progress={task['progress']['progress_percent']} "
+                f"blocked={task['progress']['blocked']} result={run_result} "
+                f"tier={task['plan'].get('escalation', {}).get('tier', 'standard')}"
+            )
+
+            elapsed = round(max(0.0, time.perf_counter() - started), 3)
+            after_memory = self._load_client_memory(slug) if slug else {}
+            after_reasoning = int(after_memory.get("reasoning_history", {}).get("total_calls", 0)) if isinstance(after_memory.get("reasoning_history", {}), dict) else 0
+            generated_fields = after_memory.get("generated_fields", {}) if isinstance(after_memory.get("generated_fields", {}), dict) else {}
+            generations = sum(1 for value in generated_fields.values() if str(value).strip())
+            reasoning_calls = max(0, after_reasoning - before_reasoning)
+            compute_units = {
+                "reasoning_calls": reasoning_calls,
+                "generations": generations,
+                "execution_seconds": elapsed,
+                "total": round(reasoning_calls + generations + elapsed, 3),
+            }
+            completion = {
+                "status": "success" if run_result in {"executed", "skipped"} else "failed",
+                "run_result": run_result,
+                "compute_units_used": compute_units,
+            }
+            self._log_task_complete(task, completion, runtime)
+            self._log_activity(
+                f"[TASK] complete task_id={task['task_id']} status={completion['status']} "
+                f"units={compute_units['total']:.3f}"
             )
 
     def _evaluate_and_prioritize_clients(self) -> None:
