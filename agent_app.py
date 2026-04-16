@@ -2493,13 +2493,19 @@ class AgentApp:
         if self._auto_mode:
             self._scan_and_process_inbox()
 
+    def _safe_float(self, value, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def _evaluate_goal_progress(self, goal: dict, client_context: dict) -> dict:
         evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
         memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
         target_state = goal.get("target_state", {}) if isinstance(goal.get("target_state", {}), dict) else {}
 
-        target_score = float(target_state.get("overall_score", 0.9))
-        current_score = float(evaluation.get("overall_score", 0.0))
+        target_score = self._safe_float(target_state.get("overall_score", 0.9), 0.9)
+        current_score = self._safe_float(evaluation.get("overall_score", 0.0), 0.0)
         unresolved_issues = evaluation.get("issues_detected", []) if isinstance(evaluation.get("issues_detected", []), list) else []
 
         progress_ratio = min(1.0, current_score / max(target_score, 0.01))
