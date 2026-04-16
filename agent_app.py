@@ -3252,14 +3252,16 @@ class AgentApp:
         for task in runnable:
             remaining_before_start = self._remaining_budget(runtime)
             est_cost = self._safe_float(task.get("cost_estimate", {}).get("estimated_units", 0.0), 0.0)
+            cost_multiplier = self._safe_float(runtime.get("cost_multiplier", 1.0), 1.0)
+            adjusted_est_cost = est_cost * cost_multiplier
             allow_override = (
                 task.get("execution_decision", {}).get("reason") == "aggressive_budget_override"
                 and str(runtime.get("execution_mode", "balanced")).strip().lower() == "aggressive"
             )
-            if est_cost > remaining_before_start and not allow_override:
+            if adjusted_est_cost > remaining_before_start and not allow_override:
                 self._log_activity(
                     f"[TASK] deferred task_id={task['task_id']} reason=budget_guard "
-                    f"estimated={est_cost:.2f} remaining={remaining_before_start:.2f}"
+                    f"estimated={adjusted_est_cost:.2f} remaining={remaining_before_start:.2f}"
                 )
                 continue
             assigned = self._assign_agent(task, runtime)
