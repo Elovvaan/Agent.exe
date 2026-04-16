@@ -536,6 +536,10 @@ class AgentApp:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 profile[key] = value.strip()
+            elif key in data:
+                self._log_activity(
+                    f"[PROFILE] ignored invalid value slug={client_slug} key={key}"
+                )
         return profile
 
     def _ensure_client_intelligence_profile(self, client_root: Path) -> None:
@@ -555,7 +559,9 @@ class AgentApp:
         try:
             description = template.format(name=name)
         except (KeyError, IndexError, ValueError) as exc:
-            self._log_activity(f"[PROFILE] invalid description template; using default: {exc}")
+            self._log_activity(
+                f"[PROFILE] invalid description template '{template}'; using default: {exc}"
+            )
             description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
         return description
 
