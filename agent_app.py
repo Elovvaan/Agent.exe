@@ -554,7 +554,8 @@ class AgentApp:
         ).strip()
         try:
             description = template.format(name=name)
-        except Exception:
+        except (KeyError, IndexError, ValueError) as exc:
+            self._log_activity(f"[PROFILE] invalid description template; using default: {exc}")
             description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
         return description
 
