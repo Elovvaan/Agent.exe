@@ -52,6 +52,13 @@ EVALUATION_THRESHOLD = 0.85
 REASONING_CONFIDENCE_THRESHOLD = 0.7
 SYSTEM_LEARNING_INTERVAL_CYCLES = 10
 MAX_TASK_HISTORY_SIZE = 300
+DEFAULT_MAX_UNITS_PER_CYCLE = 100
+
+EXECUTION_MODE_CONFIG = {
+    "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
+    "aggressive": {"value_threshold": 0.35, "cost_multiplier": 1.35, "allow_budget_override": True},
+    "conservative": {"value_threshold": 0.65, "cost_multiplier": 0.7, "allow_budget_override": False},
+}
 
 ADJUSTMENT_BOUNDS = {
     "evaluation_threshold": {"min": 0.70, "max": 0.95},
@@ -240,6 +247,7 @@ class AgentApp:
             "applied_adjustments": [],
             "system_score_trend": [],
             "agent_learning_signals": [],
+            "task_efficiency": {},
         }
         self._system_runtime_state = {
             "max_concurrent_tasks": 5,
@@ -247,6 +255,12 @@ class AgentApp:
             "task_history": [],
             "agent_utilization": {},
             "client_priority_map": {},
+            "compute_budget": {
+                "max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE,
+                "used_units": 0.0,
+            },
+            "execution_mode": "balanced",
+            "cycle_history": [],
         }
         self._task_round_robin_cursor = 0
 
@@ -319,6 +333,12 @@ class AgentApp:
             "task_history": [],
             "agent_utilization": {},
             "client_priority_map": {},
+            "compute_budget": {
+                "max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE,
+                "used_units": 0.0,
+            },
+            "execution_mode": "balanced",
+            "cycle_history": [],
         }
         runtime_file = self._system_runtime_file()
         if not runtime_file.exists():
@@ -335,7 +355,16 @@ class AgentApp:
                 "task_history": payload.get("task_history", []) if isinstance(payload.get("task_history", []), list) else [],
                 "agent_utilization": payload.get("agent_utilization", {}) if isinstance(payload.get("agent_utilization", {}), dict) else {},
                 "client_priority_map": payload.get("client_priority_map", {}) if isinstance(payload.get("client_priority_map", {}), dict) else {},
+                "compute_budget": payload.get("compute_budget", default_runtime["compute_budget"]) if isinstance(payload.get("compute_budget", {}), dict) else dict(default_runtime["compute_budget"]),
+                "execution_mode": str(payload.get("execution_mode", "balanced")).strip().lower(),
+                "cycle_history": payload.get("cycle_history", []) if isinstance(payload.get("cycle_history", []), list) else [],
             }
+            mode = self._system_runtime_state["execution_mode"]
+            if mode not in EXECUTION_MODE_CONFIG:
+                self._system_runtime_state["execution_mode"] = "balanced"
+            budget = self._system_runtime_state["compute_budget"]
+            budget["max_units_per_cycle"] = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
+            budget["used_units"] = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
         except Exception as exc:
             self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
             self._system_runtime_state = default_runtime
@@ -349,7 +378,15 @@ class AgentApp:
             "task_history": runtime.get("task_history", [])[-MAX_TASK_HISTORY_SIZE:] if isinstance(runtime.get("task_history", []), list) else [],
             "agent_utilization": runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {},
             "client_priority_map": runtime.get("client_priority_map", {}) if isinstance(runtime.get("client_priority_map", {}), dict) else {},
+            "compute_budget": runtime.get("compute_budget", {}) if isinstance(runtime.get("compute_budget", {}), dict) else {},
+            "execution_mode": str(runtime.get("execution_mode", "balanced")).strip().lower(),
+            "cycle_history": runtime.get("cycle_history", [])[-80:] if isinstance(runtime.get("cycle_history", []), list) else [],
         }
+        if serialized["execution_mode"] not in EXECUTION_MODE_CONFIG:
+            serialized["execution_mode"] = "balanced"
+        budget = serialized["compute_budget"]
+        budget["max_units_per_cycle"] = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
+        budget["used_units"] = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
         self._system_runtime_state = serialized
         self._system_runtime_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
 
@@ -397,6 +434,7 @@ class AgentApp:
             self._system_learning_state["applied_adjustments"] = payload.get("applied_adjustments", [])
             self._system_learning_state["system_score_trend"] = payload.get("system_score_trend", [])
             self._system_learning_state["agent_learning_signals"] = payload.get("agent_learning_signals", [])
+            self._system_learning_state["task_efficiency"] = payload.get("task_efficiency", {}) if isinstance(payload.get("task_efficiency", {}), dict) else {}
             controls = payload.get("active_controls", {})
             if isinstance(controls, dict):
                 self._learning_controls["evaluation_threshold"] = float(
@@ -427,6 +465,7 @@ class AgentApp:
             "applied_adjustments": self._system_learning_state.get("applied_adjustments", []),
             "system_score_trend": self._system_learning_state.get("system_score_trend", [])[-50:],
             "agent_learning_signals": self._system_learning_state.get("agent_learning_signals", [])[-200:],
+            "task_efficiency": self._system_learning_state.get("task_efficiency", {}),
             "active_controls": self._learning_controls,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -2569,6 +2608,7 @@ class AgentApp:
 
     def _run_supervisor_cycle(self) -> None:
         self._supervisor_cycle_count += 1
+        self._reset_cycle_compute_budget()
         self._scan_existing_clients()
         self._run_goal_supervisor_cycle()
         if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
@@ -2581,6 +2621,34 @@ class AgentApp:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    def _reset_cycle_compute_budget(self) -> None:
+        runtime = self._load_system_runtime()
+        budget = runtime.get("compute_budget", {})
+        if not isinstance(budget, dict):
+            budget = {"max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE, "used_units": 0.0}
+        max_units = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
+        previous_used = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
+        tasks_completed_this_cycle = runtime.get("tasks_completed_this_cycle", 0)
+        if not isinstance(tasks_completed_this_cycle, int) or tasks_completed_this_cycle < 0:
+            tasks_completed_this_cycle = 0
+        cycle_history = runtime.get("cycle_history", [])
+        if not isinstance(cycle_history, list):
+            cycle_history = []
+        if previous_used > 0.0 or tasks_completed_this_cycle > 0:
+            cycle_history.append(
+                {
+                    "cycle": max(0, self._supervisor_cycle_count - 1),
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "used_units": previous_used,
+                    "max_units_per_cycle": max_units,
+                    "task_count": tasks_completed_this_cycle,
+                }
+            )
+        runtime["cycle_history"] = cycle_history[-80:]
+        runtime["compute_budget"] = {"max_units_per_cycle": max_units, "used_units": 0.0}
+        runtime["tasks_completed_this_cycle"] = 0
+        self._persist_system_runtime(runtime)
 
     def _evaluate_goal_progress(self, goal: dict, client_context: dict) -> dict:
         evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
@@ -2745,29 +2813,185 @@ class AgentApp:
         client_priority = self._safe_float(self._system_runtime_state.get("client_priority_map", {}).get(slug, 0), 0.0)
         return round((goal_priority * 4.0) + (score_gap * 10.0) + (failures * 2.0) + (client_priority * 3.0), 3)
 
-    def _schedule_tasks(self, tasks: list[dict], runtime: dict) -> tuple[list[dict], list[dict]]:
+    def _execution_config(self, runtime: dict) -> dict:
+        mode = str(runtime.get("execution_mode", "balanced")).strip().lower()
+        if mode not in EXECUTION_MODE_CONFIG:
+            mode = "balanced"
+            runtime["execution_mode"] = mode
+        return EXECUTION_MODE_CONFIG[mode]
+
+    def _remaining_budget(self, runtime: dict) -> float:
+        budget = runtime.get("compute_budget", {})
+        if not isinstance(budget, dict):
+            return 0.0
+        max_units = float(max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE))))
+        used_units = max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0))
+        return max(0.0, round(max_units - used_units, 3))
+
+    def _estimate_task_cost(self, task: dict) -> dict:
+        plan = task.get("plan", {}) if isinstance(task.get("plan", {}), dict) else {}
+        progress = task.get("progress", {}) if isinstance(task.get("progress", {}), dict) else {}
+        task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+        role = str(task.get("assigned_agent", "")).strip() or "planner"
+        next_actions = task.get("next_needed_actions", []) if isinstance(task.get("next_needed_actions", []), list) else []
+
+        base_by_type = {"goal_progress": 8.0, "goal_recovery": 15.0, "quality_improvement": 10.0}
+        role_factor = {"planner": 1.0, "generator": 1.3, "evaluator": 0.8, "optimizer": 1.5}
+        expected_reasoning_calls = max(1, min(6, len(next_actions) + (2 if task.get("repeated_failure", False) else 1)))
+        plan_steps = plan.get("planner_steps", []) if isinstance(plan.get("planner_steps", []), list) else []
+
+        estimated_units = base_by_type.get(task_type, 9.0)
+        estimated_units *= role_factor.get(role, 1.0)
+        estimated_units += expected_reasoning_calls * 1.2
+        estimated_units += max(1, len(plan_steps)) * 0.8
+
+        efficiency = self._system_learning_state.get("task_efficiency", {})
+        if isinstance(efficiency, dict):
+            task_stats = efficiency.get(task_type, {})
+            if isinstance(task_stats, dict):
+                avg_cost = self._safe_float(task_stats.get("avg_cost", estimated_units), estimated_units)
+                estimated_units = round((estimated_units * 0.65) + (avg_cost * 0.35), 3)
+
+        score_gap = self._safe_float(progress.get("score_gap", task.get("score_gap", 0.0)), 0.0)
+        if score_gap > 0.30:
+            estimated_units = round(estimated_units * 1.2, 3)
+        elif score_gap < 0.10:
+            estimated_units = round(estimated_units * 0.85, 3)
+
+        if estimated_units < 8:
+            complexity = "low"
+        elif estimated_units < 16:
+            complexity = "medium"
+        else:
+            complexity = "high"
+        return {"estimated_units": round(max(1.0, estimated_units), 3), "complexity_level": complexity}
+
+    def _estimate_task_value(self, task: dict, goal: dict) -> float:
+        progress = task.get("progress", {}) if isinstance(task.get("progress", {}), dict) else {}
+        goal_priority = self._safe_float(goal.get("priority", goal.get("priority_score", 5.0)), 5.0)
+        priority_score = min(1.0, max(0.0, goal_priority / 10.0))
+        proximity = min(1.0, max(0.0, self._safe_float(progress.get("progress_percent", 0.0), 0.0) / 100.0))
+        score_gap = self._safe_float(progress.get("score_gap", task.get("score_gap", 0.0)), 0.0)
+        proximity_weight = max(0.0, min(1.0, 1.0 - score_gap))
+
+        task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+        task_efficiency = self._system_learning_state.get("task_efficiency", {}).get(task_type, {})
+        success_rate = self._safe_float(task_efficiency.get("success_rate", 0.5), 0.5) if isinstance(task_efficiency, dict) else 0.5
+        value_return = self._safe_float(task_efficiency.get("value_return", 0.5), 0.5) if isinstance(task_efficiency, dict) else 0.5
+        past_success_patterns = max(0.0, min(1.0, (success_rate * 0.6) + (value_return * 0.4)))
+
+        slug = str(task.get("client_slug", "")).strip()
+        client_priority = self._safe_float(self._system_runtime_state.get("client_priority_map", {}).get(slug, 0.0), 0.0)
+        client_priority_norm = max(0.0, min(1.0, client_priority / 10.0))
+
+        score = (
+            (priority_score * 0.40)
+            + (proximity * 0.15)
+            + (proximity_weight * 0.15)
+            + (past_success_patterns * 0.20)
+            + (client_priority_norm * 0.10)
+        )
+        return round(max(0.0, min(1.0, score)), 3)
+
+    def _mark_task_waste(self, task: dict, runtime: dict, reason: str) -> None:
+        task["waste_flag"] = True
+        task["waste_reason"] = reason
+        task["priority_score"] = round(max(0.0, self._safe_float(task.get("priority_score", 0.0), 0.0) * 0.5), 3)
+        self._log_activity(
+            f"[TASK] inefficient task_id={task.get('task_id', '')} reason={reason} flagged_for_optimizer_review=true"
+        )
+        runtime.setdefault("agent_utilization", {})
+
+    def _should_execute_task(self, task: dict, goal: dict, runtime: dict) -> dict:
+        config = self._execution_config(runtime)
+        cost = self._estimate_task_cost(task)
+        value_score = self._estimate_task_value(task, goal)
+        task["cost_estimate"] = cost
+        task["value_score"] = value_score
+        recent_history = runtime.get("task_history", [])
+        if not isinstance(recent_history, list):
+            recent_history = []
+        related = [
+            entry for entry in recent_history[-20:]
+            if isinstance(entry, dict)
+            and str(entry.get("goal_id", "")) == str(task.get("goal_id", ""))
+            and str(entry.get("client_slug", "")) == str(task.get("client_slug", ""))
+        ]
+        failed_related = [entry for entry in related if entry.get("status") == TASK_STATUS_FAILED]
+        total_related_cost = 0.0
+        for entry in related:
+            result = entry.get("result", {}) if isinstance(entry.get("result", {}), dict) else {}
+            units = result.get("compute_units_used", {}) if isinstance(result.get("compute_units_used", {}), dict) else {}
+            total_related_cost += max(0.0, self._safe_float(units.get("total", 0.0), 0.0))
+        if len(failed_related) >= GOAL_FAILURE_ESCALATION_THRESHOLD or total_related_cost >= 40.0:
+            self._mark_task_waste(task, runtime, "cost_without_progress")
+            return {"decision": "defer", "reason": "requires_optimizer_intervention"}
+
+        if task.get("repeated_failure", False):
+            self._mark_task_waste(task, runtime, "repeated_failure")
+            return {"decision": "defer", "reason": "requires_optimizer_intervention"}
+
+        threshold = float(config.get("value_threshold", 0.45))
+        if value_score < threshold:
+            return {"decision": "skip", "reason": "low_value"}
+
+        remaining_budget = self._remaining_budget(runtime)
+        adjusted_cost = cost["estimated_units"] * float(config.get("cost_multiplier", 1.0))
+        if adjusted_cost > remaining_budget:
+            goal_priority = self._safe_float(goal.get("priority", goal.get("priority_score", 0.0)), 0.0)
+            allow_override = bool(config.get("allow_budget_override", False))
+            if allow_override and goal_priority >= 9.0 and value_score >= 0.8:
+                return {"decision": "prioritize", "reason": "aggressive_budget_override"}
+            return {"decision": "defer", "reason": "budget_exceeded"}
+
+        if value_score >= min(0.95, threshold + 0.25) and adjusted_cost <= max(4.0, remaining_budget * 0.25):
+            return {"decision": "prioritize", "reason": "high_value_low_cost"}
+        return {"decision": "execute", "reason": "within_budget"}
+
+    def _schedule_tasks(self, tasks: list[dict], runtime: dict, goals_by_id: dict[str, dict]) -> tuple[list[dict], list[dict], list[dict]]:
+        skipped: list[dict] = []
+        filtered: list[dict] = []
+        deferred: list[dict] = []
+        for task in tasks:
+            goal = goals_by_id.get(str(task.get("goal_id", "")), {})
+            decision = self._should_execute_task(task, goal, runtime)
+            task["execution_decision"] = decision
+            if decision["decision"] == "skip":
+                task["status"] = TASK_STATUS_FAILED
+                task["skip_reason"] = decision["reason"]
+                skipped.append(task)
+                continue
+            if decision["decision"] == "defer":
+                task["status"] = TASK_STATUS_PENDING
+                task["defer_reason"] = decision["reason"]
+                deferred.append(task)
+                continue
+            if decision["decision"] == "prioritize":
+                task["priority_score"] = round(self._safe_float(task.get("priority_score", 0.0), 0.0) + 500.0, 3)
+            filtered.append(task)
+
         max_concurrent = max(1, int(runtime.get("max_concurrent_tasks", 5)))
         ordered = sorted(
-            tasks,
+            filtered,
             key=lambda item: (-self._safe_float(item.get("priority_score", 0.0), 0.0), str(item.get("created_at", ""))),
         )
         selected = ordered[:max_concurrent]
-        queued = ordered[max_concurrent:]
+        queued = ordered[max_concurrent:] + deferred
         if not queued or not selected:
-            return selected, queued
+            return selected, queued, skipped
 
         represented_clients = {str(task.get("client_slug", "")) for task in selected}
         all_clients = [str(task.get("client_slug", "")) for task in ordered if str(task.get("client_slug", ""))]
         unique_clients = list(dict.fromkeys(all_clients))
         missing_clients = [slug for slug in unique_clients if slug not in represented_clients]
         if not missing_clients:
-            return selected, queued
+            return selected, queued, skipped
 
         fallback_slug = missing_clients[self._task_round_robin_cursor % len(missing_clients)]
         self._task_round_robin_cursor += 1
         queued_index = next((idx for idx, task in enumerate(queued) if task.get("client_slug") == fallback_slug), -1)
         if queued_index < 0:
-            return selected, queued
+            return selected, queued, skipped
         fallback_task = queued.pop(queued_index)
         lowest_index = min(
             range(len(selected)),
@@ -2775,7 +2999,7 @@ class AgentApp:
         )
         queued.append(selected[lowest_index])
         selected[lowest_index] = fallback_task
-        return selected, queued
+        return selected, queued, skipped
 
     def _assign_agent(self, task: dict, runtime: dict) -> str:
         pool = self._create_agent_pool(int(runtime.get("max_concurrent_tasks", 5)))
@@ -2846,8 +3070,11 @@ class AgentApp:
         finalized["status"] = TASK_STATUS_COMPLETED if result.get("status") == "success" else TASK_STATUS_FAILED
         finalized["completed_at"] = datetime.now().isoformat(timespec="seconds")
         finalized["result"] = result
+        finalized["cost_estimate"] = task.get("cost_estimate", {})
+        finalized["value_score"] = task.get("value_score", 0.0)
         history.append(finalized)
         runtime["task_history"] = history[-MAX_TASK_HISTORY_SIZE:]
+        self._update_compute_usage(task, result, runtime)
         self._persist_system_runtime(runtime)
 
         slug = str(task.get("client_slug", "")).strip()
@@ -2883,6 +3110,61 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
 
+    def _update_task_efficiency_stats(self, task: dict, result: dict, actual_units: float) -> None:
+        task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+        efficiency = self._system_learning_state.get("task_efficiency", {})
+        if not isinstance(efficiency, dict):
+            efficiency = {}
+        stats = efficiency.get(task_type, {})
+        if not isinstance(stats, dict):
+            stats = {}
+        samples = max(0, int(stats.get("samples", 0)))
+        success_samples = max(0, int(stats.get("success_samples", 0)))
+        total_value = self._safe_float(stats.get("total_value", 0.0), 0.0)
+        total_cost = self._safe_float(stats.get("total_cost", 0.0), 0.0)
+
+        samples += 1
+        total_cost += actual_units
+        total_value += self._safe_float(task.get("value_score", 0.0), 0.0)
+        if result.get("status") == "success":
+            success_samples += 1
+
+        avg_cost = round(total_cost / max(1, samples), 3)
+        success_rate = round(success_samples / max(1, samples), 3)
+        value_return = round(total_value / max(1, samples), 3)
+        efficiency[task_type] = {
+            "samples": samples,
+            "success_samples": success_samples,
+            "total_cost": round(total_cost, 3),
+            "total_value": round(total_value, 3),
+            "avg_cost": avg_cost,
+            "success_rate": success_rate,
+            "value_return": value_return,
+        }
+        self._system_learning_state["task_efficiency"] = efficiency
+        self._persist_system_learning_state()
+
+    def _update_compute_usage(self, task: dict, result: dict, runtime: dict) -> None:
+        units = result.get("compute_units_used", {}) if isinstance(result.get("compute_units_used", {}), dict) else {}
+        actual_units = round(max(0.0, self._safe_float(units.get("total", 0.0), 0.0)), 3)
+        budget = runtime.get("compute_budget", {})
+        if not isinstance(budget, dict):
+            budget = {"max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE, "used_units": 0.0}
+        max_units = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
+        used_units = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
+        used_units = min(float(max_units), round(used_units + actual_units, 3))
+        budget["max_units_per_cycle"] = max_units
+        budget["used_units"] = used_units
+        runtime["compute_budget"] = budget
+
+        estimated = task.get("cost_estimate", {}) if isinstance(task.get("cost_estimate", {}), dict) else {}
+        result["cost_comparison"] = {
+            "estimated_units": self._safe_float(estimated.get("estimated_units", 0.0), 0.0),
+            "actual_units": actual_units,
+            "delta_units": round(actual_units - self._safe_float(estimated.get("estimated_units", 0.0), 0.0), 3),
+        }
+        self._update_task_efficiency_stats(task, result, actual_units)
+
     def _run_goal_supervisor_cycle(self) -> None:
         active_goals = self._load_active_goals()
         if not active_goals:
@@ -2891,9 +3173,11 @@ class AgentApp:
         runtime = self._load_system_runtime()
         runtime["agent_utilization"] = runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {}
         tasks: list[dict] = []
+        goals_by_id: dict[str, dict] = {}
         created_at = datetime.now().isoformat(timespec="seconds")
         for goal in active_goals:
             goal_id = str(goal.get("goal_id", ""))
+            goals_by_id[goal_id] = goal
             slug = str(goal.get("client_slug", "")).strip()
             if not slug:
                 self._log_activity(f"[GOAL] skipped goal_id={goal_id} reason=missing_client_slug")
@@ -2952,18 +3236,39 @@ class AgentApp:
                 "next_needed_actions": progress.get("next_needed_actions", []),
                 "repeated_failure": progress.get("repeated_failure", False),
                 "score_gap": progress.get("score_gap", 0.0),
+                "goal_priority": self._safe_float(goal.get("priority", goal.get("priority_score", 5.0)), 5.0),
             }
             tasks.append(task)
 
-        runnable, queued = self._schedule_tasks(tasks, runtime)
+        runnable, queued, skipped = self._schedule_tasks(tasks, runtime, goals_by_id)
+        for task in skipped:
+            self._log_activity(
+                f"[TASK] skipped task_id={task['task_id']} goal_id={task['goal_id']} "
+                f"reason={task.get('skip_reason', 'low_value')} value={self._safe_float(task.get('value_score', 0.0), 0.0):.2f}"
+            )
         for task in queued:
             task["status"] = TASK_STATUS_PENDING
             self._log_activity(
                 f"[TASK] queued task_id={task['task_id']} goal_id={task['goal_id']} "
-                f"slug={task['client_slug']} priority={task['priority_score']:.2f}"
+                f"slug={task['client_slug']} priority={task['priority_score']:.2f} "
+                f"reason={task.get('defer_reason', 'capacity')}"
             )
 
         for task in runnable:
+            remaining_before_start = self._remaining_budget(runtime)
+            est_cost = self._safe_float(task.get("cost_estimate", {}).get("estimated_units", 0.0), 0.0)
+            cost_multiplier = self._safe_float(runtime.get("cost_multiplier", 1.0), 1.0)
+            adjusted_est_cost = est_cost * cost_multiplier
+            allow_override = (
+                task.get("execution_decision", {}).get("reason") == "aggressive_budget_override"
+                and str(runtime.get("execution_mode", "balanced")).strip().lower() == "aggressive"
+            )
+            if adjusted_est_cost > remaining_before_start and not allow_override:
+                self._log_activity(
+                    f"[TASK] deferred task_id={task['task_id']} reason=budget_guard "
+                    f"estimated={adjusted_est_cost:.2f} remaining={remaining_before_start:.2f}"
+                )
+                continue
             assigned = self._assign_agent(task, runtime)
             if not assigned:
                 self._log_activity(f"[TASK] queued task_id={task['task_id']} reason=agent_pool_saturated")
