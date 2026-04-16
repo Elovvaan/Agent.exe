@@ -2892,9 +2892,10 @@ class AgentApp:
     def _mark_task_waste(self, task: dict, runtime: dict, reason: str) -> None:
         task["waste_flag"] = True
         task["waste_reason"] = reason
-        task["assigned_agent"] = "optimizer"
         task["priority_score"] = round(max(0.0, self._safe_float(task.get("priority_score", 0.0), 0.0) * 0.5), 3)
-        self._log_activity(f"[TASK] inefficient task_id={task.get('task_id', '')} reason={reason} routed_to=optimizer")
+        self._log_activity(
+            f"[TASK] inefficient task_id={task.get('task_id', '')} reason={reason} flagged_for_optimizer_review=true"
+        )
         runtime.setdefault("agent_utilization", {})
 
     def _should_execute_task(self, task: dict, goal: dict, runtime: dict) -> dict:
