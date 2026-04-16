@@ -775,19 +775,31 @@ class AgentApp:
         if raw_input:
             identity = {"slug": slug, "name": str(raw_input.get("name", "")).strip()}
 
-        truth_data, truth_status = self._safe_read_json_dict(notes_file, f"{slug}:notes/client.json")
-        if truth_status == "ok":
-            included_sources.append("truth")
-            identity["name"] = str(truth_data.get("name", identity.get("name", ""))).strip()
-
-        profile_data, profile_status = self._safe_read_json_dict(
-            profile_file, f"{slug}:notes/intelligence_profile.json"
+        skip_disk_sources = bool(
+            raw_input and client_root.exists() and raw_input.get("overwrite") is not True
         )
-        if profile_status == "ok":
-            included_sources.append("profile")
+        if skip_disk_sources:
+            self._log_activity(
+                f"[CONTEXT] skipped disk-backed sources for {slug}: existing client root detected "
+                "while building context for inbound data without overwrite"
+            )
+            truth_data, truth_status = {}, "skipped"
+            profile_data, profile_status = {}, "skipped"
+            memory = {}
+        else:
+            truth_data, truth_status = self._safe_read_json_dict(notes_file, f"{slug}:notes/client.json")
+            if truth_status == "ok":
+                included_sources.append("truth")
+                identity["name"] = str(truth_data.get("name", identity.get("name", ""))).strip()
 
-        memory = self._load_client_memory(slug)
-        included_sources.append("memory")
+            profile_data, profile_status = self._safe_read_json_dict(
+                profile_file, f"{slug}:notes/intelligence_profile.json"
+            )
+            if profile_status == "ok":
+                included_sources.append("profile")
+
+            memory = self._load_client_memory(slug)
+            included_sources.append("memory")
         evaluation = memory.get("last_evaluation", {})
         stable = bool(memory.get("stable", False))
         frozen = bool(profile_data.get("freeze", False) or memory.get("freeze", False))
