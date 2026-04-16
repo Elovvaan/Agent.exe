@@ -109,14 +109,15 @@ Then open **Artifacts** → `Agent-windows-bundle`.
   - `allowed_domains`
   - `max_actions_per_cycle`
   - `require_approval`
+  - `command_enabled`
 - Supervisor now runs:
   1. propose actions
   2. validate actions
-  3. execute approved actions (or hold for approval)
+  3. execute actions only when policy allows them without approval; otherwise record them as `pending_approval` and hold execution until approval is granted
   4. log results
 - Safety guardrails:
   - `FILE_WRITE` limited to `clients/<slug>/safe_outputs/`
   - network actions limited to whitelisted domains
   - protected truth/system files are blocked
-  - `COMMAND` disabled unless explicitly enabled
+  - `COMMAND` disabled unless explicitly enabled via `command_enabled`
 - `clients/<slug>/memory.json` now includes `action_history` for durable execution tracking.
