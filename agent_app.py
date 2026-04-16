@@ -129,6 +129,7 @@ EVENT_VERIFICATION_FAILED = "verification_failed"
 EVENT_GOAL_PROGRESS_UPDATED = "goal_progress_updated"
 EVENT_EXPLORATION_NEEDED = "exploration_needed"
 EVENT_OPTIMIZER_ESCALATION = "optimizer_escalation"
+EVENT_MARKDOWN_INJECTION_FAILED = "markdown_injection_failed"
 SUPPORTED_EVENT_TYPES = {
     EVENT_TASK_READY,
     EVENT_TASK_ASSIGNED,
@@ -140,11 +141,22 @@ SUPPORTED_EVENT_TYPES = {
     EVENT_GOAL_PROGRESS_UPDATED,
     EVENT_EXPLORATION_NEEDED,
     EVENT_OPTIMIZER_ESCALATION,
+    EVENT_MARKDOWN_INJECTION_FAILED,
 }
 HIGH_PRIORITY_EVENT_TYPES = {
     EVENT_TASK_FAILED,
     EVENT_VERIFICATION_FAILED,
     EVENT_OPTIMIZER_ESCALATION,
+    EVENT_MARKDOWN_INJECTION_FAILED,
+}
+MARKDOWN_TASK_LINE_RE = re.compile(r"^\s*-\s*\[([^\]]+)\]\s*(.+?)\s*$")
+MARKDOWN_GOAL_HEADER_RE = re.compile(r"^\s*#{1,6}\s*Goal\s*:\s*(.+?)\s*$", re.IGNORECASE)
+MARKDOWN_PRIORITY_SCORE_MAP = {
+    "critical": 140.0,
+    "high": 120.0,
+    "medium": 80.0,
+    "normal": 80.0,
+    "low": 50.0,
 }
 DEFAULT_ACTION_POLICY = {
     "allowed_actions": [ACTION_FILE_WRITE, ACTION_NO_OP],
@@ -330,6 +342,9 @@ class AgentApp:
         self._event_router_lock = threading.Lock()
         self._event_trace_seq = 0
         self._event_handler_pool = ThreadPoolExecutor(max_workers=max(2, int(self._system_runtime_state.get("max_concurrent_tasks", 5))))
+        self._markdown_file_state: dict[str, dict] = {}
+        self._markdown_seen_fingerprints: set[str] = set()
+        self._markdown_runtime_log = self.paths["logs"] / "markdown_runtime.log"
 
         self._ensure_core_structure()
         self._load_system_learning_state()
@@ -791,7 +806,7 @@ class AgentApp:
 
     def _execute_task_and_emit_completion(self, task: dict, cycle_state: dict) -> None:
         runtime = cycle_state.get("runtime", {})
-        task_result = self._execute_goal_task_worker(task, runtime)
+        task_result = self._execute_goal_task_worker(task)
         task_results = [task_result] if task_result else []
         if task_results:
             self._persist_runtime_checkpoint("after_task_completion_batch", runtime)
@@ -1045,6 +1060,12 @@ class AgentApp:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
             self._log_activity(
                 f"[TASK] optimizer_escalation task_id={task.get('task_id', '')} reason={payload.get('reason', 'unspecified')}"
+            )
+            return
+        if event_type == EVENT_MARKDOWN_INJECTION_FAILED:
+            self._log_activity(
+                f"[MARKDOWN] injection_failed slug={payload.get('client_slug', '')} "
+                f"file={payload.get('source_file', '')} reason={payload.get('reason', 'unknown')}"
             )
 
     def _drain_event_queue(self, cycle_state: dict, cycle_budget: int) -> int:
@@ -3635,6 +3656,252 @@ class AgentApp:
         runtime["tasks_completed_this_cycle"] = 0
         self._persist_system_runtime(runtime)
 
+    def _resolve_markdown_client_context(self, file_path: Path) -> tuple[str, str]:
+        try:
+            relative_parent = file_path.resolve().parent.relative_to(self.paths["clients"].resolve())
+            segments = [part for part in relative_parent.parts if part and part != "."]
+            segments = [part for part in segments if part != "inbox"]
+            if segments:
+                client_slug = self.sanitize_client_name(str(segments[0]))
+                context_id = "/".join(segments)
+                return client_slug, context_id
+        except Exception:
+            pass
+        fallback_slug = self.sanitize_client_name(file_path.parent.name)
+        fallback_context = str(file_path.parent.name)
+        return fallback_slug, fallback_context
+
+    def _priority_score_from_markdown_hints(self, hints: dict) -> float:
+        if not isinstance(hints, dict):
+            return MARKDOWN_PRIORITY_SCORE_MAP["normal"]
+        priority_raw = str(hints.get("priority", "normal")).strip().lower()
+        base = MARKDOWN_PRIORITY_SCORE_MAP.get(priority_raw, MARKDOWN_PRIORITY_SCORE_MAP["normal"])
+        if any(flag in hints for flag in ("explore", "exploration")):
+            base += 8.0
+        if any(flag in hints for flag in ("urgent", "asap")):
+            base += 15.0
+        return round(max(1.0, base), 3)
+
+    def _parse_markdown_tasks(self, file_path: Path) -> list[dict]:
+        path = Path(file_path)
+        if not path.exists() or path.suffix.lower() != ".md":
+            return []
+        source = path.read_text(encoding="utf-8")
+        content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        client_slug, context_id = self._resolve_markdown_client_context(path)
+        goal = ""
+        parsed: list[dict] = []
+        for line_no, raw_line in enumerate(source.splitlines(), start=1):
+            goal_match = MARKDOWN_GOAL_HEADER_RE.match(raw_line)
+            if goal_match:
+                goal = goal_match.group(1).strip()
+                continue
+            task_match = MARKDOWN_TASK_LINE_RE.match(raw_line)
+            if not task_match:
+                continue
+            tag_body = task_match.group(1).strip()
+            task_text = task_match.group(2).strip()
+            if not task_text:
+                continue
+            tag_parts = [part.strip().lower() for part in re.split(r"\s+", tag_body) if part.strip()]
+            if not tag_parts or not tag_parts[0].startswith("task"):
+                continue
+            hints: dict[str, str | bool] = {}
+            for token in tag_parts[1:]:
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key:
+                        hints[key] = value
+                else:
+                    hints[token] = True
+            fingerprint_seed = f"{path.resolve()}|{line_no}|{goal}|{task_text}|{json.dumps(hints, sort_keys=True)}"
+            task_fingerprint = hashlib.sha256(fingerprint_seed.encode("utf-8")).hexdigest()
+            parsed.append(
+                {
+                    "task_id": f"md-{task_fingerprint[:16]}",
+                    "task_fingerprint": task_fingerprint,
+                    "content_hash": content_hash,
+                    "source_file": str(path.resolve()),
+                    "line_number": line_no,
+                    "goal": goal,
+                    "task_text": task_text,
+                    "priority": str(hints.get("priority", "normal")).strip().lower(),
+                    "hints": hints,
+                    "priority_score": self._priority_score_from_markdown_hints(hints),
+                    "client_slug": client_slug,
+                    "context_id": context_id,
+                }
+            )
+        return parsed
+
+    def _inject_markdown_tasks(self, parsed_tasks: list[dict], client_slug: str, cycle_state: dict | None = None) -> int:
+        if not isinstance(parsed_tasks, list):
+            return 0
+        injected = 0
+        for parsed in parsed_tasks:
+            try:
+                if not isinstance(parsed, dict):
+                    continue
+                task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
+                if not task_fingerprint or task_fingerprint in self._markdown_seen_fingerprints:
+                    continue
+                slug = str(parsed.get("client_slug", client_slug)).strip() or client_slug
+                if not slug or not (self.paths["clients"] / slug).exists():
+                    self._emit_event(
+                        EVENT_MARKDOWN_INJECTION_FAILED,
+                        {
+                            "source": "markdown",
+                            "reason": "missing_client_context",
+                            "client_slug": slug,
+                            "source_file": parsed.get("source_file", ""),
+                            "line_number": parsed.get("line_number", 0),
+                        },
+                        cycle_state=cycle_state,
+                    )
+                    continue
+                _, runtime_session = self._get_client_context_from_session(slug)
+                task = {
+                    "task_id": str(parsed.get("task_id", "")),
+                    "client_slug": slug,
+                    "goal_id": f"markdown::{parsed.get('context_id', slug)}::{parsed.get('goal', 'adhoc') or 'adhoc'}",
+                    "priority_score": self._safe_float(parsed.get("priority_score", 0.0), MARKDOWN_PRIORITY_SCORE_MAP["normal"]),
+                    "status": TASK_STATUS_PENDING,
+                    "assigned_agent": "",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "reason": f"markdown:{parsed.get('goal', '')}:{parsed.get('task_text', '')}",
+                    "plan": {
+                        "goal": parsed.get("goal", ""),
+                        "next_needed_actions": [parsed.get("task_text", "")],
+                        "safety_constraints": {
+                            "respect_action_policy": True,
+                            "respect_validation_layer": True,
+                            "deny_protected_paths_override": True,
+                        },
+                    },
+                    "progress": {
+                        "progress_percent": 0,
+                        "current_score": 0.0,
+                        "target_score": 1.0,
+                        "score_gap": 1.0,
+                        "blocked": False,
+                        "repeated_failure": False,
+                        "next_needed_actions": [parsed.get("task_text", "")],
+                    },
+                    "next_needed_actions": [parsed.get("task_text", "")],
+                    "repeated_failure": False,
+                    "score_gap": 1.0,
+                    "goal_priority": self._safe_float(parsed.get("priority_score", 0.0), MARKDOWN_PRIORITY_SCORE_MAP["normal"]),
+                    "runtime_session_id": str(runtime_session.get("runtime_session_id", "")),
+                    "exploration_task": bool(parsed.get("hints", {}).get("explore") or parsed.get("hints", {}).get("exploration")),
+                    "source": "markdown",
+                    "markdown_source": {
+                        "file_path": parsed.get("source_file", ""),
+                        "line_number": parsed.get("line_number", 0),
+                        "goal": parsed.get("goal", ""),
+                        "task_text": parsed.get("task_text", ""),
+                        "priority": parsed.get("priority", "normal"),
+                        "hints": parsed.get("hints", {}),
+                        "content_hash": parsed.get("content_hash", ""),
+                        "task_fingerprint": task_fingerprint,
+                        "context_id": parsed.get("context_id", ""),
+                    },
+                }
+                self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
+                self._emit_event(EVENT_TASK_READY, {"task": task}, cycle_state=cycle_state)
+                self._markdown_seen_fingerprints.add(task_fingerprint)
+                injected += 1
+            except Exception as exc:
+                self._emit_event(
+                    EVENT_MARKDOWN_INJECTION_FAILED,
+                    {
+                        "source": "markdown",
+                        "reason": f"inject_exception:{type(exc).__name__}:{exc}",
+                        "client_slug": client_slug,
+                        "source_file": parsed.get("source_file", "") if isinstance(parsed, dict) else "",
+                    },
+                    cycle_state=cycle_state,
+                )
+        return injected
+
+    def _poll_markdown_task_controls(self, cycle_state: dict | None = None) -> int:
+        markdown_files = sorted(
+            p for p in self.paths["clients"].glob("**/*.md")
+            if p.is_file() and "inbox" not in p.parts
+        )
+        changed_files: list[Path] = []
+        live_paths = {str(path.resolve()) for path in markdown_files}
+        for path in markdown_files:
+            key = str(path.resolve())
+            try:
+                stat = path.stat()
+                signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+            except OSError:
+                continue
+            previous = self._markdown_file_state.get(key, {})
+            if signature != previous.get("signature", ""):
+                changed_files.append(path)
+        for stale in [key for key in self._markdown_file_state.keys() if key not in live_paths]:
+            self._markdown_file_state.pop(stale, None)
+        total_injected = 0
+        for file_path in changed_files:
+            key = str(file_path.resolve())
+            try:
+                parsed = self._parse_markdown_tasks(file_path)
+                previous = self._markdown_file_state.get(key, {})
+                previous_ids = set(previous.get("task_fingerprints", []))
+                delta = [item for item in parsed if str(item.get("task_fingerprint", "")) not in previous_ids]
+                if delta:
+                    slug = str(delta[0].get("client_slug", "")).strip()
+                    total_injected += self._inject_markdown_tasks(delta, slug, cycle_state=cycle_state)
+                    self._log_activity(
+                        f"[MARKDOWN] injected file={file_path.name} total={len(parsed)} delta={len(delta)} slug={slug}"
+                    )
+                stat = file_path.stat()
+                self._markdown_file_state[key] = {
+                    "signature": f"{stat.st_mtime_ns}:{stat.st_size}",
+                    "task_fingerprints": [str(item.get("task_fingerprint", "")) for item in parsed if str(item.get("task_fingerprint", ""))],
+                }
+            except Exception as exc:
+                client_slug, _ = self._resolve_markdown_client_context(file_path)
+                self._emit_event(
+                    EVENT_MARKDOWN_INJECTION_FAILED,
+                    {
+                        "source": "markdown",
+                        "reason": f"parse_exception:{type(exc).__name__}:{exc}",
+                        "client_slug": client_slug,
+                        "source_file": str(file_path.resolve()),
+                    },
+                    cycle_state=cycle_state,
+                )
+        return total_injected
+
+    def _log_markdown_task_result(self, task: dict, result: dict) -> None:
+        source = task.get("markdown_source", {}) if isinstance(task.get("markdown_source", {}), dict) else {}
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "task_id": task.get("task_id", ""),
+            "client_slug": task.get("client_slug", ""),
+            "status": task.get("status", ""),
+            "result": result.get("status", ""),
+            "run_result": result.get("run_result", ""),
+            "verification": result.get("verification", {}),
+            "markdown": {
+                "file_path": source.get("file_path", ""),
+                "line_number": source.get("line_number", 0),
+                "goal": source.get("goal", ""),
+                "task_text": source.get("task_text", ""),
+                "task_fingerprint": source.get("task_fingerprint", ""),
+            },
+        }
+        try:
+            self._markdown_runtime_log.parent.mkdir(parents=True, exist_ok=True)
+            with self._markdown_runtime_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as exc:
+            self._log_activity(f"[MARKDOWN] runtime_log_failed error={type(exc).__name__}:{exc}")
+
     def _evaluate_goal_progress(self, goal: dict, client_context: dict) -> dict:
         evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
         memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
@@ -4137,6 +4404,8 @@ class AgentApp:
         finalized["value_score"] = task.get("value_score", 0.0)
         history.append(finalized)
         runtime["task_history"] = history[-MAX_TASK_HISTORY_SIZE:]
+        if str(task.get("source", "")).strip().lower() == "markdown":
+            self._log_markdown_task_result(finalized, result)
         self._update_compute_usage(task, result, runtime)
         self._persist_system_runtime(runtime)
 
@@ -4321,8 +4590,6 @@ class AgentApp:
 
     def _run_goal_supervisor_event_cycle(self) -> None:
         active_goals = self._load_active_goals()
-        if not active_goals:
-            return
         runtime = self._load_system_runtime()
         with self._runtime_bus_lock:
             persisted_events = runtime.get("pending_events", [])
@@ -4338,6 +4605,22 @@ class AgentApp:
         self._persist_runtime_checkpoint("after_cycle_start_snapshot", runtime)
         goals_by_id: dict[str, dict] = {}
         tasks: list[dict] = []
+        cycle_state = {
+            "runtime": runtime,
+            "goals_by_id": goals_by_id,
+            "event_lock": threading.RLock(),
+            "routing_futures": [],
+            "fallback_phase18": False,
+            "goal_completion_recorded": False,
+            "progress_advanced": False,
+            "verification_failures": 0,
+            "event_failures": 0,
+        }
+        markdown_injected = self._poll_markdown_task_controls(cycle_state=cycle_state)
+        with self._runtime_bus_lock:
+            has_pending_events = bool(self._runtime_bus.get("pending_events"))
+        if not active_goals and markdown_injected <= 0 and not has_pending_events:
+            return
         created_at = datetime.now().isoformat(timespec="seconds")
         for goal in active_goals:
             goal_id = str(goal.get("goal_id", ""))
@@ -4404,17 +4687,6 @@ class AgentApp:
                 f"slug={task['client_slug']} priority={task['priority_score']:.2f} "
                 f"reason={task.get('defer_reason', 'capacity')}"
             )
-        cycle_state = {
-            "runtime": runtime,
-            "goals_by_id": goals_by_id,
-            "event_lock": threading.RLock(),
-            "routing_futures": [],
-            "fallback_phase18": False,
-            "goal_completion_recorded": False,
-            "progress_advanced": False,
-            "verification_failures": 0,
-            "event_failures": 0,
-        }
         for task in runnable:
             self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
             self._emit_event(EVENT_TASK_READY, {"task": task}, cycle_state=cycle_state)

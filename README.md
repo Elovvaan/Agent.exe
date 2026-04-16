@@ -158,3 +158,19 @@ Then open **Artifacts** → `Agent-windows-bundle`.
   - immediate vs queued route ratio
   - routing collisions and retries
 - Deterministic fallback remains in place: queued drain loop still processes events when router fallback is activated.
+
+## 12) Phase 20: Markdown-driven task injection + control layer
+- Markdown files under `clients/**` are now scanned as a control surface for runtime tasks.
+- Supported markdown pattern:
+  - goal headers: `## Goal: ...`
+  - task lines: `- [task ...] ...`
+  - optional hints: `priority=high`, `explore`, `urgent`
+- Folder paths map to runtime context:
+  - `clients/<slug>/<subpath>/file.md` → `client_slug=<slug>`, `context_id=<slug>/<subpath>`
+- Parsed markdown tasks are converted to runtime `task_ready` events and injected into the Phase 19 event bus.
+- Injection is deduplicated by task fingerprint/content hash and only delta tasks are injected when markdown files change.
+- Markdown hints are mapped into runtime `priority_score` and exploration flags.
+- Markdown input is control-only:
+  - execution still flows through routing, budget checks, policy gates, and verification.
+- Injection failures emit `markdown_injection_failed` events without blocking the runtime loop.
+- Markdown task execution feedback is written to `logs/markdown_runtime.log`.
