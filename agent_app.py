@@ -26,7 +26,7 @@ from urllib.request import Request, urlopen
 try:
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
-except Exception:
+except ImportError:
     FileSystemEventHandler = None
     Observer = None
 
@@ -263,30 +263,35 @@ class ClientAnalysis:
         }
 
 
-class MarkdownTaskControlEventHandler(FileSystemEventHandler if FileSystemEventHandler else object):
-    def __init__(self, app: "AgentApp"):
-        self.app = app
+if FileSystemEventHandler is not None:
+    class MarkdownTaskControlEventHandler(FileSystemEventHandler):
+        def __init__(self, app: "AgentApp"):
+            self.app = app
 
-    def on_created(self, event):
-        if getattr(event, "is_directory", False):
-            return
-        self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "created")
+        def on_created(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "created")
 
-    def on_modified(self, event):
-        if getattr(event, "is_directory", False):
-            return
-        self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "modified")
+        def on_modified(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "modified")
 
-    def on_deleted(self, event):
-        if getattr(event, "is_directory", False):
-            return
-        self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
+        def on_deleted(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
 
-    def on_moved(self, event):
-        if getattr(event, "is_directory", False):
-            return
-        self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
-        self.app._schedule_markdown_file_event(getattr(event, "dest_path", ""), "created")
+        def on_moved(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
+            self.app._schedule_markdown_file_event(getattr(event, "dest_path", ""), "created")
+else:
+    class MarkdownTaskControlEventHandler:
+        def __init__(self, app: "AgentApp"):
+            self.app = app
 
 
 class AgentApp:
@@ -3724,11 +3729,20 @@ class AgentApp:
             base += 15.0
         return round(max(1.0, base), 3)
 
-    def _markdown_task_signature(self, parsed: dict) -> str:
-        if not isinstance(parsed, dict):
-            return ""
-        task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
-        content_hash = str(parsed.get("content_hash", "")).strip()
+    def _markdown_task_signature(
+        self,
+        parsed: dict,
+        task_fingerprint: str | None = None,
+        content_hash: str | None = None,
+    ) -> str:
+        if task_fingerprint is None or content_hash is None:
+            if not isinstance(parsed, dict):
+                return ""
+            task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
+            content_hash = str(parsed.get("content_hash", "")).strip()
+        else:
+            task_fingerprint = str(task_fingerprint).strip()
+            content_hash = str(content_hash).strip()
         if not task_fingerprint:
             return ""
         return f"{task_fingerprint}:{content_hash}" if content_hash else task_fingerprint
@@ -3798,18 +3812,19 @@ class AgentApp:
             existing = self._markdown_debounce_timers.pop(key, None)
             if existing is not None:
                 existing.cancel()
-            timer = threading.Timer(MARKDOWN_DEBOUNCE_SECONDS, self._handle_debounced_markdown_change, args=(key, event_kind))
+            deletion_event = event_kind == "deleted"
+            timer = threading.Timer(MARKDOWN_DEBOUNCE_SECONDS, self._handle_debounced_markdown_change, args=(key, deletion_event))
             timer.daemon = True
             self._markdown_debounce_timers[key] = timer
             timer.start()
 
-    def _handle_debounced_markdown_change(self, path_key: str, event_kind: str) -> None:
+    def _handle_debounced_markdown_change(self, path_key: str, is_deletion: bool) -> None:
         with self._markdown_watch_lock:
             self._markdown_debounce_timers.pop(path_key, None)
         if self._stop_event.is_set():
             return
         path = Path(path_key)
-        if event_kind == "deleted" or not path.exists():
+        if is_deletion or not path.exists():
             with self._markdown_state_lock:
                 self._markdown_file_state.pop(str(path.resolve(strict=False)), None)
             return
@@ -3818,10 +3833,15 @@ class AgentApp:
     def _process_markdown_file(self, file_path: Path, cycle_state: dict | None = None, trigger_source: str = "poll") -> int:
         key = str(file_path.resolve())
         parsed = self._parse_markdown_tasks(file_path)
+        parsed_with_signatures = [
+            (item, self._markdown_task_signature(item))
+            for item in parsed
+            if isinstance(item, dict)
+        ]
         with self._markdown_state_lock:
             previous = self._markdown_file_state.get(key, {})
             previous_signatures = set(previous.get("task_signatures", []))
-        delta = [item for item in parsed if self._markdown_task_signature(item) not in previous_signatures]
+        delta = [item for item, signature in parsed_with_signatures if signature and signature not in previous_signatures]
         injected = 0
         if delta:
             slug = str(delta[0].get("client_slug", "")).strip()
@@ -3830,7 +3850,7 @@ class AgentApp:
                 f"[MARKDOWN] injected file={file_path.name} total={len(parsed)} delta={len(delta)} slug={slug} source={trigger_source}"
             )
         stat = file_path.stat()
-        task_signatures = [self._markdown_task_signature(item) for item in parsed if self._markdown_task_signature(item)]
+        task_signatures = [signature for _, signature in parsed_with_signatures if signature]
         with self._markdown_state_lock:
             self._markdown_file_state[key] = {
                 "signature": f"{stat.st_mtime_ns}:{stat.st_size}",
@@ -3901,9 +3921,10 @@ class AgentApp:
                 if not isinstance(parsed, dict):
                     continue
                 task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
-                task_signature = self._markdown_task_signature(parsed)
-                if not task_fingerprint or not task_signature:
+                if not task_fingerprint:
                     continue
+                content_hash = str(parsed.get("content_hash", "")).strip()
+                task_signature = self._markdown_task_signature(parsed, task_fingerprint=task_fingerprint, content_hash=content_hash)
                 with self._markdown_state_lock:
                     duplicate = task_signature in self._markdown_seen_signatures
                 if duplicate:
