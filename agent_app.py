@@ -589,10 +589,12 @@ class AgentApp:
 
             with notes_file.open("w", encoding="utf-8") as f:
                 json.dump(data.to_dict(), f, indent=2)
-            self._action_policy_path(client_slug).write_text(
-                json.dumps(DEFAULT_ACTION_POLICY, indent=2),
-                encoding="utf-8",
-            )
+            policy_path = self._action_policy_path(client_slug)
+            if not policy_path.exists():
+                policy_path.write_text(
+                    json.dumps(DEFAULT_ACTION_POLICY, indent=2),
+                    encoding="utf-8",
+                )
 
             self.refresh_client_list()
             self.selected_client = client_slug
