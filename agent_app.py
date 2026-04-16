@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import traceback
@@ -17,7 +18,8 @@ from tkinter import (
     Scrollbar, StringVar, Tk, Toplevel,
     filedialog, messagebox,
 )
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 PLACEHOLDERS = {
@@ -62,6 +64,26 @@ SUPPORTED_REASONING_TASK_TYPES = {
     "improve_cta",
     "suggest_actions",
     "semantic_quality_check",
+}
+ACTION_FILE_WRITE = "FILE_WRITE"
+ACTION_API_CALL = "API_CALL"
+ACTION_WEBHOOK = "WEBHOOK"
+ACTION_COMMAND = "COMMAND"
+ACTION_NO_OP = "NO_OP"
+SUPPORTED_ACTION_TYPES = {
+    ACTION_FILE_WRITE,
+    ACTION_API_CALL,
+    ACTION_WEBHOOK,
+    ACTION_COMMAND,
+    ACTION_NO_OP,
+}
+PROTECTED_PATH_MARKERS = ("notes/client.json", "notes/system_learning.json", "config.json")
+DEFAULT_ACTION_POLICY = {
+    "allowed_actions": [ACTION_FILE_WRITE, ACTION_NO_OP],
+    "allowed_domains": [],
+    "max_actions_per_cycle": 3,
+    "require_approval": True,
+    "command_enabled": False,
 }
 AGENT_PLANNER = "PLANNER_AGENT"
 AGENT_GENERATOR = "GENERATOR_AGENT"
@@ -567,6 +589,12 @@ class AgentApp:
 
             with notes_file.open("w", encoding="utf-8") as f:
                 json.dump(data.to_dict(), f, indent=2)
+            policy_path = self._action_policy_path(client_slug)
+            if not policy_path.exists():
+                policy_path.write_text(
+                    json.dumps(DEFAULT_ACTION_POLICY, indent=2),
+                    encoding="utf-8",
+                )
 
             self.refresh_client_list()
             self.selected_client = client_slug
@@ -1186,6 +1214,7 @@ class AgentApp:
             "source_signature": "",
             "last_context_summary": {},
             "reasoning_history": {},
+            "action_history": [],
             "agent_performance": {
                 "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
                 "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
@@ -1213,6 +1242,7 @@ class AgentApp:
                 "source_signature": data.get("source_signature", ""),
                 "last_context_summary": data.get("last_context_summary", {}),
                 "reasoning_history": data.get("reasoning_history", {}),
+                "action_history": data.get("action_history", []),
                 "agent_performance": data.get("agent_performance", empty_memory["agent_performance"]),
                 "timestamp": data.get("timestamp", ""),
             }
@@ -1239,6 +1269,7 @@ class AgentApp:
             "source_signature": data.get("source_signature", existing.get("source_signature", "")),
             "last_context_summary": data.get("last_context_summary", existing.get("last_context_summary", {})),
             "reasoning_history": data.get("reasoning_history", existing.get("reasoning_history", {})),
+            "action_history": data.get("action_history", existing.get("action_history", [])),
             "agent_performance": data.get("agent_performance", existing.get("agent_performance", {
                 "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
                 "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
@@ -1271,6 +1302,50 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
         self._log_activity(f"[CONTEXT] persisted summary slug={slug}")
+
+    def _action_policy_path(self, slug: str) -> Path:
+        return self.paths["clients"] / slug / "action_policy.json"
+
+    def _load_action_policy(self, slug: str) -> dict:
+        policy_path = self._action_policy_path(slug)
+        if not policy_path.exists():
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+            policy_path.write_text(json.dumps(DEFAULT_ACTION_POLICY, indent=2), encoding="utf-8")
+            return dict(DEFAULT_ACTION_POLICY)
+        try:
+            parsed = json.loads(policy_path.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                return dict(DEFAULT_ACTION_POLICY)
+            merged = dict(DEFAULT_ACTION_POLICY)
+            merged.update(parsed)
+            allowed_actions = merged.get("allowed_actions", [])
+            if not isinstance(allowed_actions, list):
+                allowed_actions = DEFAULT_ACTION_POLICY["allowed_actions"]
+            merged["allowed_actions"] = [str(item).strip() for item in allowed_actions if str(item).strip()]
+            allowed_domains = merged.get("allowed_domains", [])
+            if not isinstance(allowed_domains, list):
+                allowed_domains = []
+            merged["allowed_domains"] = [str(item).strip().lower() for item in allowed_domains if str(item).strip()]
+            try:
+                merged["max_actions_per_cycle"] = max(0, int(merged.get("max_actions_per_cycle", 0)))
+            except Exception:
+                merged["max_actions_per_cycle"] = DEFAULT_ACTION_POLICY["max_actions_per_cycle"]
+            merged["require_approval"] = bool(merged.get("require_approval", True))
+            merged["command_enabled"] = bool(merged.get("command_enabled", False))
+            return merged
+        except Exception as exc:
+            self._log_activity(f"[ACTION] failed_to_load_policy slug={slug} error={exc}")
+            return dict(DEFAULT_ACTION_POLICY)
+
+    def _append_action_history(self, slug: str, entry: dict) -> None:
+        memory = self._load_client_memory(slug)
+        history = memory.get("action_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        memory["action_history"] = history[-200:]
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
 
     def _record_agent_learning_signal(
         self,
@@ -1708,6 +1783,7 @@ class AgentApp:
             }
             memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
             self._update_client_memory(final_analysis.slug, memory)
+            self._process_external_actions(final_analysis.slug, final_analysis, execution_results)
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=processed")
         except Exception as exc:
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=failed error={exc}")
@@ -2065,6 +2141,197 @@ class AgentApp:
             "execution_results": execution_results,
         }
 
+    def _propose_actions(self, client_context: dict) -> dict:
+        analysis = client_context.get("analysis") if isinstance(client_context.get("analysis"), dict) else {}
+        execution_results = client_context.get("execution_results", {})
+        optimizer = client_context.get("optimizer_output", {})
+        slug = str(client_context.get("slug", "")).strip()
+        proposed_actions: list[dict] = []
+
+        if slug:
+            summary_payload = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "analysis_summary": {
+                    "completeness_score": analysis.get("completeness_score"),
+                    "validation_warnings": analysis.get("validation_warnings", []),
+                    "action_plan": analysis.get("action_plan", []),
+                },
+                "execution_results": execution_results if isinstance(execution_results, dict) else {},
+                "optimizer_actions": optimizer.get("actions", []) if isinstance(optimizer, dict) else [],
+            }
+            proposed_actions.append(
+                {
+                    "type": ACTION_FILE_WRITE,
+                    "target": f"clients/{slug}/safe_outputs/action_summary.json",
+                    "payload": summary_payload,
+                    "reason": "Persist deterministic execution summary for external consumers",
+                    "confidence": 0.92,
+                }
+            )
+
+        if not proposed_actions:
+            proposed_actions.append(
+                {
+                    "type": ACTION_NO_OP,
+                    "target": "none",
+                    "payload": {},
+                    "reason": "No safe external actions proposed",
+                    "confidence": 1.0,
+                }
+            )
+        return {"proposed_actions": proposed_actions}
+
+    def _validate_action(self, action: dict, slug: str, policy: dict) -> tuple[bool, str]:
+        action_type = str(action.get("type", "")).strip()
+        target = str(action.get("target", "")).strip()
+        if action_type not in SUPPORTED_ACTION_TYPES:
+            return False, "unsupported_action_type"
+        if action_type not in policy.get("allowed_actions", []):
+            return False, "action_type_not_allowed_by_policy"
+
+        if any(marker in target.replace("\\", "/") for marker in PROTECTED_PATH_MARKERS):
+            return False, "target_is_protected"
+
+        if action_type == ACTION_FILE_WRITE:
+            expected_root = (self.paths["clients"] / slug / "safe_outputs").resolve()
+            target_path = (self.base_dir / Path(target)).resolve()
+            try:
+                target_path.relative_to(expected_root)
+            except Exception:
+                return False, "file_write_outside_safe_outputs"
+
+        if action_type in {ACTION_API_CALL, ACTION_WEBHOOK}:
+            parsed = urlparse(target)
+            host = (parsed.hostname or "").lower()
+            if not host:
+                return False, "invalid_network_target"
+            allowed_domains = policy.get("allowed_domains", [])
+            if host not in allowed_domains:
+                return False, "domain_not_whitelisted"
+
+        if action_type == ACTION_COMMAND:
+            if not bool(policy.get("command_enabled", False)):
+                return False, "command_disabled"
+
+        return True, "ok"
+
+    def _execute_action(self, action: dict, slug: str, policy: dict) -> dict:
+        action_type = str(action.get("type", "")).strip()
+        target = str(action.get("target", "")).strip()
+        payload = action.get("payload", {})
+
+        if action_type == ACTION_NO_OP:
+            return {"status": "skipped", "details": "no_op"}
+
+        if action_type == ACTION_FILE_WRITE:
+            output_root = (self.paths["clients"] / slug / "safe_outputs").resolve()
+            output_root.mkdir(parents=True, exist_ok=True)
+            target_path = (self.base_dir / Path(target)).resolve()
+            try:
+                target_path.relative_to(output_root)
+            except Exception:
+                return {"status": "failed", "details": "file_write_outside_safe_outputs"}
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            return {"status": "success", "details": f"wrote:{target_path}"}
+
+        if action_type in {ACTION_API_CALL, ACTION_WEBHOOK}:
+            body = json.dumps(payload if isinstance(payload, dict) else {"payload": payload}).encode("utf-8")
+            req = Request(target, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(req, timeout=8) as resp:
+                response_code = getattr(resp, "status", 200)
+            return {"status": "success", "details": f"http_status:{response_code}"}
+
+        if action_type == ACTION_COMMAND:
+            command = payload.get("command", []) if isinstance(payload, dict) else []
+            if not isinstance(command, list) or not command:
+                return {"status": "failed", "details": "missing_command_payload"}
+            completed = subprocess.run(
+                [str(token) for token in command],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return {
+                "status": "success" if completed.returncode == 0 else "failed",
+                "details": f"returncode:{completed.returncode}",
+            }
+
+        return {"status": "failed", "details": "unsupported_action_runtime"}
+
+    def _process_external_actions(self, slug: str, analysis: ClientAnalysis, execution_results: dict) -> None:
+        policy = self._load_action_policy(slug)
+        proposed = self._propose_actions(
+            {
+                "slug": slug,
+                "analysis": analysis.to_log_dict(),
+                "execution_results": execution_results,
+            }
+        ).get("proposed_actions", [])
+        if not isinstance(proposed, list):
+            proposed = []
+
+        max_actions = int(policy.get("max_actions_per_cycle", 0))
+        queued_actions = proposed[:max_actions] if max_actions > 0 else []
+        self._log_activity(
+            f"[ACTION] proposed slug={slug} count={len(proposed)} queued={len(queued_actions)} require_approval={policy.get('require_approval', True)}"
+        )
+        for action in queued_actions:
+            self._append_action_history(
+                slug,
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "stage": "proposed",
+                    "action": action,
+                },
+            )
+            is_valid, reason = self._validate_action(action, slug, policy)
+            if not is_valid:
+                self._log_activity(f"[ACTION] rejected slug={slug} type={action.get('type')} reason={reason}")
+                self._append_action_history(
+                    slug,
+                    {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "stage": "rejected",
+                        "action": action,
+                        "result": {"status": "rejected", "reason": reason},
+                    },
+                )
+                continue
+
+            if bool(policy.get("require_approval", True)):
+                self._log_activity(f"[ACTION] pending_approval slug={slug} type={action.get('type')}")
+                self._append_action_history(
+                    slug,
+                    {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "stage": "pending_approval",
+                        "action": action,
+                    },
+                )
+                continue
+
+            try:
+                result = self._execute_action(action, slug, policy)
+                self._log_activity(
+                    f"[ACTION] executed slug={slug} type={action.get('type')} status={result.get('status')}"
+                )
+            except Exception as exc:
+                result = {"status": "failed", "details": str(exc)}
+                self._log_activity(
+                    f"[ACTION] failed slug={slug} type={action.get('type')} error={exc}"
+                )
+            self._append_action_history(
+                slug,
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "stage": "executed",
+                    "action": action,
+                    "result": result,
+                },
+            )
+
     def generate_site(self):
         """Manual Generate Site button handler."""
         client_root = self._require_selected_client()
@@ -2099,6 +2366,7 @@ class AgentApp:
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                 },
             )
+            self._process_external_actions(final_analysis.slug, final_analysis, execution_results)
 
             self.status_var.set(f"Generated site for {final_analysis.slug} ({copied} files).")
             messagebox.showinfo("Generate Site", f"Generated {copied} files for {final_analysis.slug}.")
@@ -2567,6 +2835,7 @@ class AgentApp:
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                 },
             )
+            self._process_external_actions(final_analysis.slug, final_analysis, execution_results)
 
             # 5. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
