@@ -2629,21 +2629,25 @@ class AgentApp:
             budget = {"max_units_per_cycle": DEFAULT_MAX_UNITS_PER_CYCLE, "used_units": 0.0}
         max_units = max(1, int(budget.get("max_units_per_cycle", DEFAULT_MAX_UNITS_PER_CYCLE)))
         previous_used = round(max(0.0, self._safe_float(budget.get("used_units", 0.0), 0.0)), 3)
+        tasks_completed_this_cycle = runtime.get("tasks_completed_this_cycle", 0)
+        if not isinstance(tasks_completed_this_cycle, int) or tasks_completed_this_cycle < 0:
+            tasks_completed_this_cycle = 0
         cycle_history = runtime.get("cycle_history", [])
         if not isinstance(cycle_history, list):
             cycle_history = []
-        if previous_used > 0.0 or runtime.get("task_history"):
+        if previous_used > 0.0 or tasks_completed_this_cycle > 0:
             cycle_history.append(
                 {
-                    "cycle": self._supervisor_cycle_count,
+                    "cycle": max(0, self._supervisor_cycle_count - 1),
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "used_units": previous_used,
                     "max_units_per_cycle": max_units,
-                    "task_count": len(runtime.get("task_history", [])) if isinstance(runtime.get("task_history", []), list) else 0,
+                    "task_count": tasks_completed_this_cycle,
                 }
             )
         runtime["cycle_history"] = cycle_history[-80:]
         runtime["compute_budget"] = {"max_units_per_cycle": max_units, "used_units": 0.0}
+        runtime["tasks_completed_this_cycle"] = 0
         self._persist_system_runtime(runtime)
 
     def _evaluate_goal_progress(self, goal: dict, client_context: dict) -> dict:
