@@ -46,6 +46,14 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
 
 INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
 EVALUATION_THRESHOLD = 0.85
+REASONING_CONFIDENCE_THRESHOLD = 0.7
+
+SUPPORTED_REASONING_TASK_TYPES = {
+    "improve_description",
+    "improve_cta",
+    "suggest_actions",
+    "semantic_quality_check",
+}
 
 JOB_PENDING    = "pending"
 JOB_PROCESSING = "processing"
@@ -885,8 +893,173 @@ class AgentApp:
             "source_signature": source_signature,
             "included_sources": included_sources,
             "field_sources": field_sources,
+            "source_attribution": {
+                "included_sources": included_sources,
+                "field_sources": field_sources,
+                "source_signature": source_signature,
+            },
             "analysis_input": merged,
         }
+
+    def _run_local_reasoning(self, client_context: dict, task_type: str) -> dict:
+        """
+        Phase 11: constrained local reasoning layer.
+
+        Uses only structured client_context data and returns strict structured JSON shape:
+          - proposed_fields {}
+          - reasoning_notes []
+          - confidence_score
+          - source_basis []
+        """
+        if not isinstance(client_context, dict):
+            raise ValueError("client_context must be a dictionary")
+        if task_type not in SUPPORTED_REASONING_TASK_TYPES:
+            raise ValueError(f"Unsupported task_type: {task_type}")
+
+        truth_data = client_context.get("truth_data", {}) if isinstance(client_context.get("truth_data", {}), dict) else {}
+        profile = client_context.get("profile", {}) if isinstance(client_context.get("profile", {}), dict) else {}
+        memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
+        evaluation_snapshot = client_context.get("last_evaluation_summary", {})
+        if not isinstance(evaluation_snapshot, dict):
+            evaluation_snapshot = {}
+        source_attribution = client_context.get("source_attribution", {})
+        if not isinstance(source_attribution, dict):
+            source_attribution = {}
+        analysis_input = client_context.get("analysis_input", {})
+        if not isinstance(analysis_input, dict):
+            analysis_input = {}
+
+        proposed_fields: dict = {}
+        reasoning_notes: list[str] = []
+        confidence_score = 0.45
+        source_basis = sorted(set(source_attribution.get("included_sources", [])))
+        if not source_basis:
+            source_basis = sorted(set(client_context.get("included_sources", [])))
+
+        name = str(analysis_input.get("name", "")).strip()
+        business_type = str(analysis_input.get("business_type", "")).strip()
+        brand_style = str(analysis_input.get("brand_style", "")).strip()
+        prior_generated = memory.get("generated_fields", {}) if isinstance(memory.get("generated_fields", {}), dict) else {}
+
+        if task_type == "improve_description":
+            current_description = str(analysis_input.get("description", "")).strip()
+            if current_description and len(current_description) >= 80:
+                reasoning_notes.append("description_already_sufficient")
+                confidence_score = 0.5
+            else:
+                style_phrase = brand_style if brand_style else "clear and professional"
+                subject = name if name else "your business"
+                service_ref = business_type if business_type else "local services"
+                proposed_fields["description"] = (
+                    f"{subject} delivers trusted {service_ref} with a {style_phrase} approach. "
+                    "Our team focuses on quality outcomes, responsive support, and a smooth client experience."
+                ).strip()
+                if str(prior_generated.get("description", "")).strip():
+                    reasoning_notes.append("memory_description_available_but_refreshed_for_context_alignment")
+                    confidence_score = 0.79
+                else:
+                    reasoning_notes.append("description_generated_from_truth_profile_context")
+                    confidence_score = 0.83
+
+        elif task_type == "improve_cta":
+            current_primary = str(analysis_input.get("cta_primary", "")).strip()
+            current_secondary = str(analysis_input.get("cta_secondary", "")).strip()
+            if current_primary and current_secondary:
+                reasoning_notes.append("cta_already_present")
+                confidence_score = 0.5
+            else:
+                proposed_fields["cta_primary"] = f"Contact {name}" if name else "Contact us today"
+                proposed_fields["cta_secondary"] = (
+                    f"Explore {business_type} options" if business_type else "Learn about our services"
+                )
+                reasoning_notes.append("cta_generated_from_structured_context")
+                confidence_score = 0.81
+
+        elif task_type == "suggest_actions":
+            issues = evaluation_snapshot.get("issues", [])
+            if not isinstance(issues, list):
+                issues = []
+            suggestions: list[str] = []
+            if any(issue.startswith("missing_") for issue in issues):
+                suggestions.append("backfill_required_fields")
+            if "description_length_out_of_bounds" in issues:
+                suggestions.append("normalize_description")
+            if "empty_cta" in issues:
+                suggestions.append("regenerate_cta")
+            proposed_fields["suggested_actions"] = sorted(set(suggestions))
+            reasoning_notes.append("actions_mapped_from_evaluation_issues")
+            confidence_score = 0.75 if suggestions else 0.55
+
+        elif task_type == "semantic_quality_check":
+            semantic_flags: list[str] = []
+            description = str(analysis_input.get("description", "")).strip().lower()
+            if description:
+                key_terms = [token for token in re.split(r"[^a-z0-9]+", f"{name} {business_type}".lower()) if len(token) >= 4]
+                if key_terms and not any(token in description for token in key_terms[:4]):
+                    semantic_flags.append("description_semantic_mismatch")
+            cta_primary = str(analysis_input.get("cta_primary", "")).strip().lower()
+            if cta_primary and not re.search(r"\b(book|call|contact|start|learn|shop|schedule|get)\b", cta_primary):
+                semantic_flags.append("cta_primary_low_actionability")
+            proposed_fields["semantic_flags"] = semantic_flags
+            proposed_fields["semantic_score"] = 1.0 if not semantic_flags else 0.72
+            reasoning_notes.append("semantic_quality_evaluated_from_context_only")
+            confidence_score = 0.74 if semantic_flags else 0.8
+
+        response_obj = {
+            "proposed_fields": proposed_fields,
+            "reasoning_notes": reasoning_notes,
+            "confidence_score": round(max(0.0, min(1.0, confidence_score)), 2),
+            "source_basis": source_basis,
+        }
+        encoded = json.dumps(response_obj, ensure_ascii=False)
+        decoded = json.loads(encoded)
+        if not self._is_valid_reasoning_output(decoded):
+            raise ValueError("Malformed reasoning response")
+        return decoded
+
+    def _is_valid_reasoning_output(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if not isinstance(payload.get("proposed_fields", {}), dict):
+            return False
+        if not isinstance(payload.get("reasoning_notes", []), list):
+            return False
+        if not isinstance(payload.get("source_basis", []), list):
+            return False
+        confidence = payload.get("confidence_score")
+        return isinstance(confidence, (int, float)) and 0.0 <= float(confidence) <= 1.0
+
+    def _validate_reasoning_proposals(self, task_type: str, proposals: dict) -> tuple[bool, str]:
+        if not isinstance(proposals, dict):
+            return False, "proposed_fields_not_object"
+        if task_type == "improve_description":
+            value = str(proposals.get("description", "")).strip()
+            if not value:
+                return False, "missing_description_proposal"
+            if len(value) < 40 or len(value) > 500:
+                return False, "description_out_of_bounds"
+        elif task_type == "improve_cta":
+            for field in ("cta_primary", "cta_secondary"):
+                value = str(proposals.get(field, "")).strip()
+                if not value:
+                    return False, f"missing_{field}_proposal"
+                if len(value) < 4 or len(value) > 80:
+                    return False, f"{field}_out_of_bounds"
+        return True, ""
+
+    def _log_reasoning_call(
+        self,
+        task_type: str,
+        confidence_score: float,
+        proposed_fields: list[str],
+        accepted: bool,
+        fallback_reason: str = "",
+    ) -> None:
+        status = "accepted" if accepted else "rejected"
+        self._log_activity(
+            f"[REASONING] task_type={task_type} confidence_score={confidence_score:.2f} "
+            f"fields={','.join(proposed_fields)} status={status} fallback_reason={fallback_reason or 'none'}"
+        )
 
     def _load_client_memory(self, slug: str) -> dict:
         """Load structured memory for a client; return empty shape if unavailable."""
@@ -1062,6 +1235,44 @@ class AgentApp:
         unique_issues = sorted(set(issues_detected))
         unique_actions = sorted(set(recommended_actions))
 
+        semantic_signal = {"used": False, "confidence_score": 0.0, "flags": []}
+        try:
+            context = self._build_client_context(slug)
+            reasoning = self._run_local_reasoning(context, "semantic_quality_check")
+            proposals = reasoning.get("proposed_fields", {})
+            semantic_flags = proposals.get("semantic_flags", []) if isinstance(proposals, dict) else []
+            if isinstance(semantic_flags, list) and reasoning.get("confidence_score", 0.0) >= REASONING_CONFIDENCE_THRESHOLD:
+                semantic_signal = {
+                    "used": True,
+                    "confidence_score": float(reasoning.get("confidence_score", 0.0)),
+                    "flags": semantic_flags,
+                }
+                if semantic_flags:
+                    unique_issues = sorted(set(unique_issues + semantic_flags))
+                    unique_actions = sorted(set(unique_actions + ["review_semantic_alignment"]))
+                self._log_reasoning_call(
+                    "semantic_quality_check",
+                    float(reasoning.get("confidence_score", 0.0)),
+                    sorted(proposals.keys()) if isinstance(proposals, dict) else [],
+                    accepted=True,
+                )
+            else:
+                self._log_reasoning_call(
+                    "semantic_quality_check",
+                    float(reasoning.get("confidence_score", 0.0)),
+                    sorted(proposals.keys()) if isinstance(proposals, dict) else [],
+                    accepted=False,
+                    fallback_reason="low_confidence_or_empty_signal",
+                )
+        except Exception as exc:
+            self._log_reasoning_call(
+                "semantic_quality_check",
+                0.0,
+                [],
+                accepted=False,
+                fallback_reason=f"fallback_due_to_error:{exc}",
+            )
+
         overall_score = round(
             (completeness_score * 0.4) + (description_score * 0.3) + (cta_score * 0.3),
             2,
@@ -1083,6 +1294,7 @@ class AgentApp:
             "overall_score": overall_score,
             "issues_detected": unique_issues,
             "recommended_actions": unique_actions,
+            "semantic_signal": semantic_signal,
             "source_signature": source_signature,
             "source_changed": source_changed,
             "stable": stable,
@@ -1241,12 +1453,92 @@ class AgentApp:
                             client_data["description"] = previous_generated["description"]
                             self._log_activity(f"[MEMORY] reused description slug={final_slug}")
                         else:
-                            client_data["description"] = (
+                            deterministic_description = (
                                 f"Welcome to {client_data['name']}. "
                                 "We provide quality services to our clients."
                             )
+                            proposed_description = ""
+                            fallback_reason = "reasoning_unavailable"
+                            try:
+                                reasoning = self._run_local_reasoning(context, "improve_description")
+                                proposals = reasoning.get("proposed_fields", {})
+                                confidence = float(reasoning.get("confidence_score", 0.0))
+                                valid_json = self._is_valid_reasoning_output(reasoning)
+                                valid_proposal, validation_reason = self._validate_reasoning_proposals(
+                                    "improve_description", proposals
+                                )
+                                truth_description = str(context.get("truth_data", {}).get("description", "")).strip()
+                                conflict_with_truth = bool(
+                                    truth_description
+                                    and str(proposals.get("description", "")).strip()
+                                    and str(proposals.get("description", "")).strip() != truth_description
+                                )
+                                if not valid_json:
+                                    fallback_reason = "invalid_structured_json"
+                                elif confidence < REASONING_CONFIDENCE_THRESHOLD:
+                                    fallback_reason = "low_confidence"
+                                elif conflict_with_truth:
+                                    fallback_reason = "conflicts_with_truth"
+                                elif not valid_proposal:
+                                    fallback_reason = validation_reason
+                                else:
+                                    proposed_description = str(proposals.get("description", "")).strip()
+                                    fallback_reason = ""
+                                    client_data["description"] = proposed_description
+                                self._log_reasoning_call(
+                                    "improve_description",
+                                    confidence,
+                                    sorted(proposals.keys()) if isinstance(proposals, dict) else [],
+                                    accepted=bool(proposed_description),
+                                    fallback_reason=fallback_reason,
+                                )
+                            except Exception as exc:
+                                fallback_reason = f"fallback_due_to_error:{exc}"
+                                self._log_reasoning_call(
+                                    "improve_description",
+                                    0.0,
+                                    [],
+                                    accepted=False,
+                                    fallback_reason=fallback_reason,
+                                )
+                            if not proposed_description:
+                                client_data["description"] = deterministic_description
 
                 elif step == "GENERATE_CTA":
+                    fallback_reason = ""
+                    reasoning_cta: dict = {}
+                    reasoning_cta_confidence = 0.0
+                    reasoning_cta_fields: list[str] = []
+                    reasoning_cta_accepted = False
+                    try:
+                        reasoning_cta = self._run_local_reasoning(context, "improve_cta")
+                        reasoning_cta_confidence = float(reasoning_cta.get("confidence_score", 0.0))
+                        proposals = reasoning_cta.get("proposed_fields", {})
+                        reasoning_cta_fields = sorted(proposals.keys()) if isinstance(proposals, dict) else []
+                        valid_json = self._is_valid_reasoning_output(reasoning_cta)
+                        valid_proposal, validation_reason = self._validate_reasoning_proposals("improve_cta", proposals)
+                        truth_data = context.get("truth_data", {})
+                        truth_primary = str(truth_data.get("cta_primary", "")).strip() if isinstance(truth_data, dict) else ""
+                        truth_secondary = str(truth_data.get("cta_secondary", "")).strip() if isinstance(truth_data, dict) else ""
+                        proposal_primary = str(proposals.get("cta_primary", "")).strip()
+                        proposal_secondary = str(proposals.get("cta_secondary", "")).strip()
+                        conflict_with_truth = (
+                            (truth_primary and proposal_primary and proposal_primary != truth_primary)
+                            or (truth_secondary and proposal_secondary and proposal_secondary != truth_secondary)
+                        )
+                        if not valid_json:
+                            fallback_reason = "invalid_structured_json"
+                        elif reasoning_cta_confidence < REASONING_CONFIDENCE_THRESHOLD:
+                            fallback_reason = "low_confidence"
+                        elif conflict_with_truth:
+                            fallback_reason = "conflicts_with_truth"
+                        elif not valid_proposal:
+                            fallback_reason = validation_reason
+                        else:
+                            reasoning_cta_accepted = True
+                    except Exception as exc:
+                        fallback_reason = f"fallback_due_to_error:{exc}"
+
                     if not client_data.get("cta_primary", "").strip():
                         if (
                             previous_results.get("GENERATE_CTA") == "success"
@@ -1255,7 +1547,12 @@ class AgentApp:
                             client_data["cta_primary"] = previous_generated["cta_primary"]
                             self._log_activity(f"[MEMORY] reused cta_primary slug={final_slug}")
                         else:
-                            client_data["cta_primary"] = "Book a free call"
+                            if reasoning_cta_accepted:
+                                client_data["cta_primary"] = str(
+                                    reasoning_cta.get("proposed_fields", {}).get("cta_primary", "")
+                                ).strip() or "Book a free call"
+                            else:
+                                client_data["cta_primary"] = "Book a free call"
                     if not client_data.get("cta_secondary", "").strip():
                         if (
                             previous_results.get("GENERATE_CTA") == "success"
@@ -1264,7 +1561,19 @@ class AgentApp:
                             client_data["cta_secondary"] = previous_generated["cta_secondary"]
                             self._log_activity(f"[MEMORY] reused cta_secondary slug={final_slug}")
                         else:
-                            client_data["cta_secondary"] = "See our services"
+                            if reasoning_cta_accepted:
+                                client_data["cta_secondary"] = str(
+                                    reasoning_cta.get("proposed_fields", {}).get("cta_secondary", "")
+                                ).strip() or "See our services"
+                            else:
+                                client_data["cta_secondary"] = "See our services"
+                    self._log_reasoning_call(
+                        "improve_cta",
+                        reasoning_cta_confidence,
+                        reasoning_cta_fields,
+                        accepted=reasoning_cta_accepted,
+                        fallback_reason=fallback_reason or ("not_needed" if reasoning_cta_accepted else "deterministic_fallback"),
+                    )
 
                 elif step == "RESOLVE_SLUG":
                     final_slug = self._resolve_unique_slug(final_slug)
