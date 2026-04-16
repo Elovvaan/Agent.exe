@@ -23,6 +23,13 @@ from tkinter import (
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:
+    FileSystemEventHandler = None
+    Observer = None
+
 
 PLACEHOLDERS = {
     "{{BUSINESS_NAME}}": "name",
@@ -151,6 +158,7 @@ HIGH_PRIORITY_EVENT_TYPES = {
 }
 MARKDOWN_TASK_LINE_RE = re.compile(r"^\s*-\s*\[([^\]]+)\]\s*(.+?)\s*$")
 MARKDOWN_GOAL_HEADER_RE = re.compile(r"^\s*#{1,6}\s*Goal\s*:\s*(.+?)\s*$", re.IGNORECASE)
+MARKDOWN_DEBOUNCE_SECONDS = 0.2
 MARKDOWN_PRIORITY_SCORE_MAP = {
     "critical": 140.0,
     "high": 120.0,
@@ -255,6 +263,37 @@ class ClientAnalysis:
         }
 
 
+if FileSystemEventHandler is not None:
+    class MarkdownTaskControlEventHandler(FileSystemEventHandler):
+        def __init__(self, app: "AgentApp"):
+            self.app = app
+
+        def on_created(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "created")
+
+        def on_modified(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "modified")
+
+        def on_deleted(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
+
+        def on_moved(self, event):
+            if getattr(event, "is_directory", False):
+                return
+            self.app._schedule_markdown_file_event(getattr(event, "src_path", ""), "deleted")
+            self.app._schedule_markdown_file_event(getattr(event, "dest_path", ""), "created")
+else:
+    class MarkdownTaskControlEventHandler:
+        def __init__(self, app: "AgentApp"):
+            self.app = app
+
+
 class AgentApp:
     def __init__(self, root: Tk):
         self.root = root
@@ -344,11 +383,20 @@ class AgentApp:
         self._event_handler_pool = ThreadPoolExecutor(max_workers=max(2, int(self._system_runtime_state.get("max_concurrent_tasks", 5))))
         self._markdown_file_state: dict[str, dict] = {}
         self._markdown_seen_fingerprints: set[str] = set()
+        self._markdown_seen_signatures: set[str] = set()
+        self._markdown_state_lock = threading.Lock()
+        self._markdown_watch_lock = threading.Lock()
+        self._markdown_debounce_timers: dict[str, threading.Timer] = {}
+        self._markdown_observer = None
+        self._markdown_watch_active = False
+        self._markdown_watch_failed = False
         self._markdown_runtime_log = self.paths["logs"] / "markdown_runtime.log"
 
         self._ensure_core_structure()
         self._load_system_learning_state()
         self._load_system_runtime()
+        self._start_markdown_control_watcher()
+        self._poll_markdown_task_controls()
         self._build_ui()
         self.refresh_client_list()
 
@@ -3681,6 +3729,135 @@ class AgentApp:
             base += 15.0
         return round(max(1.0, base), 3)
 
+    def _markdown_task_signature(
+        self,
+        parsed: dict,
+        task_fingerprint: str | None = None,
+        content_hash: str | None = None,
+    ) -> str:
+        if task_fingerprint is None or content_hash is None:
+            if not isinstance(parsed, dict):
+                return ""
+            task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
+            content_hash = str(parsed.get("content_hash", "")).strip()
+        else:
+            task_fingerprint = str(task_fingerprint).strip()
+            content_hash = str(content_hash).strip()
+        if not task_fingerprint:
+            return ""
+        return f"{task_fingerprint}:{content_hash}" if content_hash else task_fingerprint
+
+    def _is_watchable_markdown_path(self, file_path: Path) -> bool:
+        path = Path(file_path)
+        if path.suffix.lower() != ".md":
+            return False
+        try:
+            resolved = path.resolve(strict=False)
+            clients_root = self.paths["clients"].resolve()
+            resolved.relative_to(clients_root)
+            if "inbox" in resolved.parts:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _start_markdown_control_watcher(self) -> None:
+        if self._markdown_watch_active:
+            return
+        if Observer is None or FileSystemEventHandler is None:
+            self._markdown_watch_failed = True
+            self._log_activity("[MARKDOWN] watcher_unavailable fallback=polling reason=missing_watchdog")
+            return
+        try:
+            observer = Observer()
+            observer.schedule(MarkdownTaskControlEventHandler(self), str(self.paths["clients"]), recursive=True)
+            observer.start()
+            self._markdown_observer = observer
+            self._markdown_watch_active = True
+            self._markdown_watch_failed = False
+            self._log_activity("[MARKDOWN] watcher_started mode=event_driven")
+        except Exception as exc:
+            self._markdown_watch_failed = True
+            self._markdown_watch_active = False
+            self._markdown_observer = None
+            self._log_activity(f"[MARKDOWN] watcher_start_failed fallback=polling error={type(exc).__name__}:{exc}")
+
+    def _stop_markdown_control_watcher(self) -> None:
+        observer = self._markdown_observer
+        self._markdown_observer = None
+        self._markdown_watch_active = False
+        if observer is not None:
+            try:
+                observer.stop()
+                observer.join(timeout=1.0)
+            except Exception:
+                pass
+        with self._markdown_watch_lock:
+            timers = list(self._markdown_debounce_timers.values())
+            self._markdown_debounce_timers.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _schedule_markdown_file_event(self, raw_path: str, event_kind: str) -> None:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return
+        path = Path(raw_path).resolve(strict=False)
+        if not self._is_watchable_markdown_path(path):
+            return
+        key = str(path)
+        with self._markdown_watch_lock:
+            existing = self._markdown_debounce_timers.pop(key, None)
+            if existing is not None:
+                existing.cancel()
+            deletion_event = event_kind == "deleted"
+            timer = threading.Timer(MARKDOWN_DEBOUNCE_SECONDS, self._handle_debounced_markdown_change, args=(key, deletion_event))
+            timer.daemon = True
+            self._markdown_debounce_timers[key] = timer
+            timer.start()
+
+    def _handle_debounced_markdown_change(self, path_key: str, is_deletion: bool) -> None:
+        with self._markdown_watch_lock:
+            self._markdown_debounce_timers.pop(path_key, None)
+        if self._stop_event.is_set():
+            return
+        path = Path(path_key)
+        if is_deletion or not path.exists():
+            with self._markdown_state_lock:
+                self._markdown_file_state.pop(str(path.resolve(strict=False)), None)
+            return
+        self._process_markdown_file(path, cycle_state=None, trigger_source="watch")
+
+    def _process_markdown_file(self, file_path: Path, cycle_state: dict | None = None, trigger_source: str = "poll") -> int:
+        key = str(file_path.resolve())
+        parsed = self._parse_markdown_tasks(file_path)
+        parsed_with_signatures = [
+            (item, self._markdown_task_signature(item))
+            for item in parsed
+            if isinstance(item, dict)
+        ]
+        with self._markdown_state_lock:
+            previous = self._markdown_file_state.get(key, {})
+            previous_signatures = set(previous.get("task_signatures", []))
+        delta = [item for item, signature in parsed_with_signatures if signature and signature not in previous_signatures]
+        injected = 0
+        if delta:
+            slug = str(delta[0].get("client_slug", "")).strip()
+            injected = self._inject_markdown_tasks(delta, slug, cycle_state=cycle_state)
+            self._log_activity(
+                f"[MARKDOWN] injected file={file_path.name} total={len(parsed)} delta={len(delta)} slug={slug} source={trigger_source}"
+            )
+        stat = file_path.stat()
+        task_signatures = [signature for _, signature in parsed_with_signatures if signature]
+        with self._markdown_state_lock:
+            self._markdown_file_state[key] = {
+                "signature": f"{stat.st_mtime_ns}:{stat.st_size}",
+                "task_signatures": task_signatures,
+            }
+        return injected
+
     def _parse_markdown_tasks(self, file_path: Path) -> list[dict]:
         path = Path(file_path)
         if not path.exists() or path.suffix.lower() != ".md":
@@ -3744,7 +3921,13 @@ class AgentApp:
                 if not isinstance(parsed, dict):
                     continue
                 task_fingerprint = str(parsed.get("task_fingerprint", "")).strip()
-                if not task_fingerprint or task_fingerprint in self._markdown_seen_fingerprints:
+                if not task_fingerprint:
+                    continue
+                content_hash = str(parsed.get("content_hash", "")).strip()
+                task_signature = self._markdown_task_signature(parsed, task_fingerprint=task_fingerprint, content_hash=content_hash)
+                with self._markdown_state_lock:
+                    duplicate = task_signature in self._markdown_seen_signatures
+                if duplicate:
                     continue
                 slug = str(parsed.get("client_slug", client_slug)).strip() or client_slug
                 if not slug or not (self.paths["clients"] / slug).exists():
@@ -3809,7 +3992,9 @@ class AgentApp:
                 }
                 self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
                 self._emit_event(EVENT_TASK_READY, {"task": task}, cycle_state=cycle_state)
-                self._markdown_seen_fingerprints.add(task_fingerprint)
+                with self._markdown_state_lock:
+                    self._markdown_seen_fingerprints.add(task_fingerprint)
+                    self._markdown_seen_signatures.add(task_signature)
                 injected += 1
             except Exception as exc:
                 self._emit_event(
@@ -3838,36 +4023,19 @@ class AgentApp:
                 signature = f"{stat.st_mtime_ns}:{stat.st_size}"
             except OSError:
                 continue
-            previous = self._markdown_file_state.get(key, {})
+            with self._markdown_state_lock:
+                previous = self._markdown_file_state.get(key, {})
             if signature != previous.get("signature", ""):
                 changed_files.append(path)
-        for stale in list(self._markdown_file_state.keys()):
-            if stale not in live_paths:
+        with self._markdown_state_lock:
+            stale_paths = [stale for stale in self._markdown_file_state.keys() if stale not in live_paths]
+        for stale in stale_paths:
+            with self._markdown_state_lock:
                 self._markdown_file_state.pop(stale, None)
         total_injected = 0
         for file_path in changed_files:
-            key = str(file_path.resolve())
             try:
-                parsed = self._parse_markdown_tasks(file_path)
-                previous = self._markdown_file_state.get(key, {})
-                previous_ids = set(previous.get("task_fingerprints", []))
-                delta = [item for item in parsed if str(item.get("task_fingerprint", "")) not in previous_ids]
-                if delta:
-                    slug = str(delta[0].get("client_slug", "")).strip()
-                    total_injected += self._inject_markdown_tasks(delta, slug, cycle_state=cycle_state)
-                    self._log_activity(
-                        f"[MARKDOWN] injected file={file_path.name} total={len(parsed)} delta={len(delta)} slug={slug}"
-                    )
-                stat = file_path.stat()
-                task_fingerprints = []
-                for item in parsed:
-                    fingerprint = str(item.get("task_fingerprint", ""))
-                    if fingerprint:
-                        task_fingerprints.append(fingerprint)
-                self._markdown_file_state[key] = {
-                    "signature": f"{stat.st_mtime_ns}:{stat.st_size}",
-                    "task_fingerprints": task_fingerprints,
-                }
+                total_injected += self._process_markdown_file(file_path, cycle_state=cycle_state, trigger_source="poll")
             except Exception as exc:
                 client_slug, _ = self._resolve_markdown_client_context(file_path)
                 self._emit_event(
@@ -3881,6 +4049,15 @@ class AgentApp:
                     cycle_state=cycle_state,
                 )
         return total_injected
+
+    def _should_use_markdown_polling(self) -> bool:
+        if self._markdown_watch_active and self._markdown_observer is not None:
+            if self._markdown_observer.is_alive():
+                return False
+            self._markdown_watch_active = False
+            self._markdown_watch_failed = True
+            self._log_activity("[MARKDOWN] watcher_stopped fallback=polling reason=observer_not_alive")
+        return True
 
     def _log_markdown_task_result(self, task: dict, result: dict) -> None:
         source = task.get("markdown_source", {}) if isinstance(task.get("markdown_source", {}), dict) else {}
@@ -4621,7 +4798,9 @@ class AgentApp:
             "verification_failures": 0,
             "event_failures": 0,
         }
-        markdown_injected = self._poll_markdown_task_controls(cycle_state=cycle_state)
+        markdown_injected = 0
+        if self._should_use_markdown_polling():
+            markdown_injected = self._poll_markdown_task_controls(cycle_state=cycle_state)
         with self._runtime_bus_lock:
             has_pending_events = bool(self._runtime_bus.get("pending_events"))
         if not active_goals and markdown_injected <= 0 and not has_pending_events:
@@ -5442,6 +5621,7 @@ class AgentApp:
         """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
+        self._stop_markdown_control_watcher()
         self._event_handler_pool.shutdown(wait=False, cancel_futures=True)
         self._graceful_shutdown_runtime()
         self._join_background_threads(timeout=2.0)
