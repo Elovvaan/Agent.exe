@@ -63,6 +63,11 @@ SUPPORTED_REASONING_TASK_TYPES = {
     "suggest_actions",
     "semantic_quality_check",
 }
+AGENT_PLANNER = "PLANNER_AGENT"
+AGENT_GENERATOR = "GENERATOR_AGENT"
+AGENT_EVALUATOR = "EVALUATOR_AGENT"
+AGENT_OPTIMIZER = "OPTIMIZER_AGENT"
+SUPPORTED_AGENT_ROLES = {AGENT_PLANNER, AGENT_GENERATOR, AGENT_EVALUATOR, AGENT_OPTIMIZER}
 
 JOB_PENDING    = "pending"
 JOB_PROCESSING = "processing"
@@ -202,6 +207,7 @@ class AgentApp:
             "last_analysis": {},
             "applied_adjustments": [],
             "system_score_trend": [],
+            "agent_learning_signals": [],
         }
 
         self._ensure_core_structure()
@@ -267,6 +273,7 @@ class AgentApp:
             self._system_learning_state["last_analysis"] = payload.get("last_analysis", {})
             self._system_learning_state["applied_adjustments"] = payload.get("applied_adjustments", [])
             self._system_learning_state["system_score_trend"] = payload.get("system_score_trend", [])
+            self._system_learning_state["agent_learning_signals"] = payload.get("agent_learning_signals", [])
             controls = payload.get("active_controls", {})
             if isinstance(controls, dict):
                 self._learning_controls["evaluation_threshold"] = float(
@@ -296,6 +303,7 @@ class AgentApp:
             "last_analysis": self._system_learning_state.get("last_analysis", {}),
             "applied_adjustments": self._system_learning_state.get("applied_adjustments", []),
             "system_score_trend": self._system_learning_state.get("system_score_trend", [])[-50:],
+            "agent_learning_signals": self._system_learning_state.get("agent_learning_signals", [])[-200:],
             "active_controls": self._learning_controls,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -1178,6 +1186,12 @@ class AgentApp:
             "source_signature": "",
             "last_context_summary": {},
             "reasoning_history": {},
+            "agent_performance": {
+                "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
+                "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
+                "evaluator": {"consistent": 0, "total": 0, "consistency_score": 0.0},
+                "optimizer": {"improvements": 0, "total": 0, "improvement_rate": 0.0},
+            },
             "timestamp": "",
         }
         if not memory_file.exists():
@@ -1199,6 +1213,7 @@ class AgentApp:
                 "source_signature": data.get("source_signature", ""),
                 "last_context_summary": data.get("last_context_summary", {}),
                 "reasoning_history": data.get("reasoning_history", {}),
+                "agent_performance": data.get("agent_performance", empty_memory["agent_performance"]),
                 "timestamp": data.get("timestamp", ""),
             }
         except Exception as exc:
@@ -1224,6 +1239,12 @@ class AgentApp:
             "source_signature": data.get("source_signature", existing.get("source_signature", "")),
             "last_context_summary": data.get("last_context_summary", existing.get("last_context_summary", {})),
             "reasoning_history": data.get("reasoning_history", existing.get("reasoning_history", {})),
+            "agent_performance": data.get("agent_performance", existing.get("agent_performance", {
+                "planner": {"successes": 0, "total": 0, "success_rate": 0.0},
+                "generator": {"successes": 0, "total": 0, "success_rate": 0.0},
+                "evaluator": {"consistent": 0, "total": 0, "consistency_score": 0.0},
+                "optimizer": {"improvements": 0, "total": 0, "improvement_rate": 0.0},
+            })),
             "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
         }
         memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1250,6 +1271,175 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
         self._log_activity(f"[CONTEXT] persisted summary slug={slug}")
+
+    def _record_agent_learning_signal(
+        self,
+        slug: str,
+        role: str,
+        confidence: float,
+        accepted: bool,
+        improved_outcome: bool,
+        rejected: bool = False,
+    ) -> None:
+        signals = self._system_learning_state.get("agent_learning_signals", [])
+        if not isinstance(signals, list):
+            signals = []
+        signals.append(
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "slug": slug,
+                "role": role,
+                "confidence": round(max(0.0, min(1.0, confidence)), 2),
+                "accepted": bool(accepted),
+                "improved_outcome": bool(improved_outcome),
+                "rejected": bool(rejected),
+            }
+        )
+        self._system_learning_state["agent_learning_signals"] = signals[-200:]
+
+    def _record_agent_performance(self, slug: str, role: str, success: bool) -> None:
+        memory = self._load_client_memory(slug)
+        perf = memory.get("agent_performance", {})
+        if not isinstance(perf, dict):
+            perf = {}
+
+        role_key_map = {
+            AGENT_PLANNER: "planner",
+            AGENT_GENERATOR: "generator",
+            AGENT_EVALUATOR: "evaluator",
+            AGENT_OPTIMIZER: "optimizer",
+        }
+        key = role_key_map.get(role)
+        if not key:
+            return
+        node = perf.get(key, {})
+        if not isinstance(node, dict):
+            node = {}
+        node["total"] = int(node.get("total", 0)) + 1
+        if key == "evaluator":
+            node["consistent"] = int(node.get("consistent", 0)) + (1 if success else 0)
+            total = max(1, node["total"])
+            node["consistency_score"] = round(node["consistent"] / total, 3)
+        elif key == "optimizer":
+            node["improvements"] = int(node.get("improvements", 0)) + (1 if success else 0)
+            total = max(1, node["total"])
+            node["improvement_rate"] = round(node["improvements"] / total, 3)
+        else:
+            node["successes"] = int(node.get("successes", 0)) + (1 if success else 0)
+            total = max(1, node["total"])
+            node["success_rate"] = round(node["successes"] / total, 3)
+        perf[key] = node
+        memory["agent_performance"] = perf
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
+
+    def _run_agent(self, role: str, client_context: dict, task: dict) -> dict:
+        if role not in SUPPORTED_AGENT_ROLES:
+            raise ValueError(f"Unsupported agent role: {role}")
+        if not isinstance(client_context, dict):
+            raise ValueError("client_context must be a dictionary")
+        if not isinstance(task, dict):
+            raise ValueError("task must be a dictionary")
+
+        output: dict = {}
+        confidence = 0.55
+        reasoning_notes: list[str] = []
+        suggested_changes: list[str] = []
+
+        analysis_input = client_context.get("analysis_input", {})
+        if not isinstance(analysis_input, dict):
+            analysis_input = {}
+        memory = client_context.get("memory", {})
+        if not isinstance(memory, dict):
+            memory = {}
+
+        if role == AGENT_PLANNER:
+            requested_plan = task.get("requested_plan", [])
+            requested_set = set(requested_plan if isinstance(requested_plan, list) else [])
+            missing_description = not str(analysis_input.get("description", "")).strip()
+            missing_cta = (
+                not str(analysis_input.get("cta_primary", "")).strip()
+                or not str(analysis_input.get("cta_secondary", "")).strip()
+            )
+            selected_steps: list[str] = []
+            for step in ["ENRICH_DATA", "GENERATE_DESCRIPTION", "GENERATE_CTA", "RESOLVE_SLUG", "PROCEED_TO_BUILD"]:
+                if step == "GENERATE_DESCRIPTION":
+                    if step in requested_set and missing_description:
+                        selected_steps.append(step)
+                elif step == "GENERATE_CTA":
+                    if step in requested_set and missing_cta:
+                        selected_steps.append(step)
+                elif step in requested_set:
+                    selected_steps.append(step)
+            output = {"selected_steps": selected_steps}
+            reasoning_notes.append("planner_selected_required_steps_only")
+            confidence = 0.9
+
+        elif role == AGENT_GENERATOR:
+            field = str(task.get("field", "")).strip()
+            if field == "description":
+                reasoning = self._run_local_reasoning(client_context, "improve_description")
+                output = {"field": field, "value": str(reasoning.get("proposed_fields", {}).get("description", "")).strip()}
+                confidence = float(reasoning.get("confidence_score", 0.0))
+                reasoning_notes = [str(n) for n in reasoning.get("reasoning_notes", [])]
+            elif field == "cta":
+                reasoning = self._run_local_reasoning(client_context, "improve_cta")
+                proposals = reasoning.get("proposed_fields", {})
+                output = {
+                    "field": field,
+                    "value": {
+                        "cta_primary": str(proposals.get("cta_primary", "")).strip(),
+                        "cta_secondary": str(proposals.get("cta_secondary", "")).strip(),
+                    },
+                }
+                confidence = float(reasoning.get("confidence_score", 0.0))
+                reasoning_notes = [str(n) for n in reasoning.get("reasoning_notes", [])]
+
+        elif role == AGENT_EVALUATOR:
+            field = str(task.get("field", "")).strip()
+            candidate = task.get("candidate")
+            valid = False
+            score = 0.0
+            if field == "description":
+                text = str(candidate or "").strip()
+                valid = bool(text) and 40 <= len(text) <= 500
+                score = 1.0 if valid else 0.6
+            elif field == "cta":
+                payload = candidate if isinstance(candidate, dict) else {}
+                primary = str(payload.get("cta_primary", "")).strip()
+                secondary = str(payload.get("cta_secondary", "")).strip()
+                valid = bool(primary and secondary) and 4 <= len(primary) <= 80 and 4 <= len(secondary) <= 80
+                score = 1.0 if valid else 0.55
+            output = {"field": field, "accepted": valid, "score": round(score, 2)}
+            confidence = 0.88
+            if not valid:
+                suggested_changes.append(f"repair_{field}")
+
+        elif role == AGENT_OPTIMIZER:
+            evaluation = task.get("evaluation", {})
+            if not isinstance(evaluation, dict):
+                evaluation = {}
+            issues = evaluation.get("issues_detected", []) if isinstance(evaluation.get("issues_detected", []), list) else []
+            previous_results = memory.get("execution_results", {})
+            repeated_failure = any(status == "failed" for status in previous_results.values()) if isinstance(previous_results, dict) else False
+            if "description_length_out_of_bounds" in issues:
+                suggested_changes.append("normalize_description_length")
+            if "empty_cta" in issues:
+                suggested_changes.append("regenerate_cta")
+            if repeated_failure:
+                suggested_changes.append("retry_failed_steps_with_safe_defaults")
+            output = {"actions": sorted(set(suggested_changes))}
+            confidence = 0.72 if suggested_changes else 0.5
+            reasoning_notes.append("optimizer_triggered_from_low_score_or_repeated_failure")
+
+        response = {
+            "output": output,
+            "confidence": round(max(0.0, min(1.0, confidence)), 2),
+            "reasoning_notes": reasoning_notes,
+            "suggested_changes": suggested_changes,
+        }
+        json.loads(json.dumps(response, ensure_ascii=False))
+        return response
 
     def _source_signature(self, raw_data: dict) -> str:
         normalized = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
@@ -1564,6 +1754,25 @@ class AgentApp:
             previous_generated = {}
         previous_results = previous_memory.get("execution_results", {})
         execution_results: dict[str, str] = {}
+        current_context = dict(context)
+        current_context["analysis_input"] = dict(client_data)
+
+        planner_response = self._run_agent(
+            AGENT_PLANNER,
+            current_context,
+            {"requested_plan": [step for step in ordered_steps if step in planned]},
+        )
+        planner_steps = planner_response.get("output", {}).get("selected_steps", [])
+        planned = set(planner_steps if isinstance(planner_steps, list) else [])
+        self._record_agent_performance(final_slug, AGENT_PLANNER, success=bool(planned))
+        self._record_agent_learning_signal(
+            final_slug,
+            AGENT_PLANNER,
+            float(planner_response.get("confidence", 0.0)),
+            accepted=bool(planned),
+            improved_outcome=True,
+            rejected=not bool(planned),
+        )
 
         for field in ("description", "cta_primary", "cta_secondary"):
             if not str(client_data.get(field, "")).strip() and str(previous_generated.get(field, "")).strip():
@@ -1596,91 +1805,120 @@ class AgentApp:
                                 "We provide quality services to our clients."
                             )
                             proposed_description = ""
-                            fallback_reason = "reasoning_unavailable"
+                            fallback_reason = "deterministic_fallback"
                             try:
-                                reasoning = self._run_local_reasoning(context, "improve_description")
-                                proposals = reasoning.get("proposed_fields", {})
-                                confidence = float(reasoning.get("confidence_score", 0.0))
-                                valid_json = self._is_valid_reasoning_output(reasoning)
-                                valid_proposal, validation_reason = self._validate_reasoning_proposals(
-                                    "improve_description", proposals
+                                generator = self._run_agent(
+                                    AGENT_GENERATOR,
+                                    current_context,
+                                    {"field": "description"},
                                 )
+                                candidate = str(generator.get("output", {}).get("value", "")).strip()
+                                confidence = float(generator.get("confidence", 0.0))
                                 truth_description = str(context.get("truth_data", {}).get("description", "")).strip()
                                 conflict_with_truth = bool(
                                     truth_description
-                                    and str(proposals.get("description", "")).strip()
-                                    and str(proposals.get("description", "")).strip() != truth_description
+                                    and candidate
+                                    and candidate != truth_description
                                 )
-                                if not valid_json:
-                                    fallback_reason = "invalid_structured_json"
-                                elif confidence < self._effective_reasoning_threshold():
+                                evaluator = self._run_agent(
+                                    AGENT_EVALUATOR,
+                                    current_context,
+                                    {"field": "description", "candidate": candidate},
+                                )
+                                eval_accepted = bool(evaluator.get("output", {}).get("accepted", False))
+                                if confidence < self._effective_reasoning_threshold():
                                     fallback_reason = "low_confidence"
                                 elif conflict_with_truth:
                                     fallback_reason = "conflicts_with_truth"
-                                elif not valid_proposal:
-                                    fallback_reason = validation_reason
+                                elif not eval_accepted:
+                                    fallback_reason = "evaluator_rejected"
                                 else:
-                                    proposed_description = str(proposals.get("description", "")).strip()
+                                    proposed_description = candidate
                                     fallback_reason = ""
                                     client_data["description"] = proposed_description
-                                self._log_reasoning_call(
-                                    "improve_description",
+                                self._record_agent_performance(final_slug, AGENT_GENERATOR, success=bool(proposed_description))
+                                self._record_agent_performance(final_slug, AGENT_EVALUATOR, success=eval_accepted)
+                                self._record_agent_learning_signal(
+                                    final_slug,
+                                    AGENT_GENERATOR,
                                     confidence,
-                                    sorted(proposals.keys()) if isinstance(proposals, dict) else [],
                                     accepted=bool(proposed_description),
-                                    fallback_reason=fallback_reason,
-                                    slug=final_slug,
+                                    improved_outcome=bool(proposed_description),
+                                    rejected=not bool(proposed_description),
+                                )
+                                self._record_agent_learning_signal(
+                                    final_slug,
+                                    AGENT_EVALUATOR,
+                                    float(evaluator.get("confidence", 0.0)),
+                                    accepted=eval_accepted,
+                                    improved_outcome=eval_accepted,
+                                    rejected=not eval_accepted,
                                 )
                             except Exception as exc:
                                 fallback_reason = f"fallback_due_to_error:{exc}"
-                                self._log_reasoning_call(
-                                    "improve_description",
-                                    0.0,
-                                    [],
-                                    accepted=False,
-                                    fallback_reason=fallback_reason,
-                                    slug=final_slug,
-                                )
                             if not proposed_description:
                                 client_data["description"] = deterministic_description
 
                 elif step == "GENERATE_CTA":
                     fallback_reason = ""
-                    reasoning_cta: dict = {}
                     reasoning_cta_confidence = 0.0
                     reasoning_cta_fields: list[str] = []
                     reasoning_cta_accepted = False
+                    cta_proposals: dict = {}
                     needs_cta_generation = (
                         not client_data.get("cta_primary", "").strip()
                         or not client_data.get("cta_secondary", "").strip()
                     )
                     if needs_cta_generation:
                         try:
-                            reasoning_cta = self._run_local_reasoning(context, "improve_cta")
-                            reasoning_cta_confidence = float(reasoning_cta.get("confidence_score", 0.0))
-                            proposals = reasoning_cta.get("proposed_fields", {})
-                            reasoning_cta_fields = sorted(proposals.keys()) if isinstance(proposals, dict) else []
-                            valid_json = self._is_valid_reasoning_output(reasoning_cta)
-                            valid_proposal, validation_reason = self._validate_reasoning_proposals("improve_cta", proposals)
+                            generator = self._run_agent(
+                                AGENT_GENERATOR,
+                                current_context,
+                                {"field": "cta"},
+                            )
+                            reasoning_cta_confidence = float(generator.get("confidence", 0.0))
+                            cta_proposals = generator.get("output", {}).get("value", {})
+                            cta_proposals = cta_proposals if isinstance(cta_proposals, dict) else {}
+                            reasoning_cta_fields = sorted(cta_proposals.keys())
                             truth_data = context.get("truth_data", {})
                             truth_primary = str(truth_data.get("cta_primary", "")).strip() if isinstance(truth_data, dict) else ""
                             truth_secondary = str(truth_data.get("cta_secondary", "")).strip() if isinstance(truth_data, dict) else ""
-                            proposal_primary = str(proposals.get("cta_primary", "")).strip()
-                            proposal_secondary = str(proposals.get("cta_secondary", "")).strip()
+                            proposal_primary = str(cta_proposals.get("cta_primary", "")).strip()
+                            proposal_secondary = str(cta_proposals.get("cta_secondary", "")).strip()
                             conflict_with_truth = (
                                 (truth_primary and proposal_primary and proposal_primary != truth_primary)
                                 or (truth_secondary and proposal_secondary and proposal_secondary != truth_secondary)
                             )
-                            if not valid_json:
-                                fallback_reason = "invalid_structured_json"
-                            elif reasoning_cta_confidence < self._effective_reasoning_threshold():
+                            if reasoning_cta_confidence < self._effective_reasoning_threshold():
                                 fallback_reason = "low_confidence"
                             elif conflict_with_truth:
                                 fallback_reason = "conflicts_with_truth"
-                            elif not valid_proposal:
-                                fallback_reason = validation_reason
                             else:
-                                reasoning_cta_accepted = True
+                                evaluator = self._run_agent(
+                                    AGENT_EVALUATOR,
+                                    current_context,
+                                    {"field": "cta", "candidate": cta_proposals},
+                                )
+                                reasoning_cta_accepted = bool(evaluator.get("output", {}).get("accepted", False))
+                                fallback_reason = "" if reasoning_cta_accepted else "evaluator_rejected"
+                                self._record_agent_performance(final_slug, AGENT_EVALUATOR, success=reasoning_cta_accepted)
+                                self._record_agent_learning_signal(
+                                    final_slug,
+                                    AGENT_EVALUATOR,
+                                    float(evaluator.get("confidence", 0.0)),
+                                    accepted=reasoning_cta_accepted,
+                                    improved_outcome=reasoning_cta_accepted,
+                                    rejected=not reasoning_cta_accepted,
+                                )
+                            self._record_agent_performance(final_slug, AGENT_GENERATOR, success=reasoning_cta_accepted)
+                            self._record_agent_learning_signal(
+                                final_slug,
+                                AGENT_GENERATOR,
+                                reasoning_cta_confidence,
+                                accepted=reasoning_cta_accepted,
+                                improved_outcome=reasoning_cta_accepted,
+                                rejected=not reasoning_cta_accepted,
+                            )
                         except Exception as exc:
                             fallback_reason = f"fallback_due_to_error:{exc}"
                     else:
@@ -1696,7 +1934,7 @@ class AgentApp:
                         else:
                             if reasoning_cta_accepted:
                                 client_data["cta_primary"] = str(
-                                    reasoning_cta.get("proposed_fields", {}).get("cta_primary", "")
+                                    cta_proposals.get("cta_primary", "")
                                 ).strip() or "Book a free call"
                             else:
                                 client_data["cta_primary"] = "Book a free call"
@@ -1710,17 +1948,14 @@ class AgentApp:
                         else:
                             if reasoning_cta_accepted:
                                 client_data["cta_secondary"] = str(
-                                    reasoning_cta.get("proposed_fields", {}).get("cta_secondary", "")
+                                    cta_proposals.get("cta_secondary", "")
                                 ).strip() or "See our services"
                             else:
                                 client_data["cta_secondary"] = "See our services"
-                    self._log_reasoning_call(
-                        "improve_cta",
-                        reasoning_cta_confidence,
-                        reasoning_cta_fields,
-                        accepted=reasoning_cta_accepted,
-                        fallback_reason=fallback_reason or ("none" if reasoning_cta_accepted else "deterministic_fallback"),
-                        slug=final_slug,
+                    self._log_activity(
+                        f"[AGENT] generator_cta confidence={reasoning_cta_confidence:.2f} "
+                        f"fields={','.join(reasoning_cta_fields)} accepted={reasoning_cta_accepted} "
+                        f"fallback_reason={fallback_reason or 'none'}"
                     )
 
                 elif step == "RESOLVE_SLUG":
@@ -1737,10 +1972,46 @@ class AgentApp:
 
                 self._log_activity(f"[ACTION] {step} status=success")
                 execution_results[step] = "success"
+                current_context["analysis_input"] = dict(client_data)
             except Exception:
                 self._log_activity(f"[ACTION] {step} status=failed")
                 execution_results[step] = "failed"
                 raise
+
+        evaluator_summary = self._run_agent(
+            AGENT_EVALUATOR,
+            current_context,
+            {"field": "description", "candidate": client_data.get("description", "")},
+        )
+        final_evaluator_ok = bool(evaluator_summary.get("output", {}).get("accepted", False))
+        self._record_agent_performance(final_slug, AGENT_EVALUATOR, success=final_evaluator_ok)
+        self._record_agent_learning_signal(
+            final_slug,
+            AGENT_EVALUATOR,
+            float(evaluator_summary.get("confidence", 0.0)),
+            accepted=final_evaluator_ok,
+            improved_outcome=final_evaluator_ok,
+            rejected=not final_evaluator_ok,
+        )
+
+        current_score = 1.0 if final_evaluator_ok else 0.7
+        repeated_failure = any(status == "failed" for status in previous_results.values())
+        if current_score < float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)) or repeated_failure:
+            optimizer = self._run_agent(
+                AGENT_OPTIMIZER,
+                current_context,
+                {"evaluation": {"issues_detected": []}},
+            )
+            has_suggestions = bool(optimizer.get("output", {}).get("actions", []))
+            self._record_agent_performance(final_slug, AGENT_OPTIMIZER, success=has_suggestions)
+            self._record_agent_learning_signal(
+                final_slug,
+                AGENT_OPTIMIZER,
+                float(optimizer.get("confidence", 0.0)),
+                accepted=has_suggestions,
+                improved_outcome=has_suggestions,
+                rejected=not has_suggestions,
+            )
 
         updated_analysis = ClientAnalysis(
             name=client_analysis.name,
