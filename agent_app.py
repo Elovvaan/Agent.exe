@@ -1075,27 +1075,28 @@ class AgentApp:
             return {}, "missing"
         cache_node = None
         cache_key = str(path.resolve())
-        if isinstance(runtime_session, dict):
-            cache_node = runtime_session.setdefault("cache", {}).setdefault("loaded_files", {})
-            stat = path.stat()
-            signature = f"{stat.st_mtime_ns}:{stat.st_size}"
-            cached = cache_node.get(cache_key)
-            runtime_session["metrics"]["cache_lookups"] += 1
-            if isinstance(cached, dict) and cached.get("signature") == signature:
-                runtime_session["metrics"]["cache_hits"] += 1
-                return dict(cached.get("data", {})), str(cached.get("status", "ok"))
+        signature = None
         try:
+            if isinstance(runtime_session, dict):
+                cache_node = runtime_session.setdefault("cache", {}).setdefault("loaded_files", {})
+                stat = path.stat()
+                signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+                cached = cache_node.get(cache_key)
+                runtime_session["metrics"]["cache_lookups"] += 1
+                if isinstance(cached, dict) and cached.get("signature") == signature:
+                    runtime_session["metrics"]["cache_hits"] += 1
+                    return dict(cached.get("data", {})), str(cached.get("status", "ok"))
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 self._log_activity(f"[CONTEXT] ignored {label}: expected object got {type(data).__name__}")
                 return {}, "invalid"
-            if isinstance(runtime_session, dict):
+            if isinstance(runtime_session, dict) and signature is not None:
                 runtime_session["metrics"]["disk_reads_saved_candidates"] += 1
                 cache_node[cache_key] = {"signature": signature, "data": data, "status": "ok"}
             return data, "ok"
         except Exception as exc:
             self._log_activity(f"[CONTEXT] ignored {label}: {exc}")
-            if isinstance(runtime_session, dict):
+            if isinstance(runtime_session, dict) and signature is not None:
                 cache_node[cache_key] = {"signature": signature, "data": {}, "status": "invalid"}
             return {}, "invalid"
 
