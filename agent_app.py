@@ -355,20 +355,14 @@ class AgentApp:
 
     def _create_agent_pool(self, max_concurrent_tasks: int) -> dict[str, int]:
         capacity = max(1, int(max_concurrent_tasks))
-        per_role = max(1, capacity // 4)
-        pool = {
-            "planner": per_role,
-            "generator": per_role,
-            "evaluator": per_role,
-            "optimizer": per_role,
-        }
-        remainder = max(0, capacity - sum(pool.values()))
         ordered_roles = ["planner", "generator", "evaluator", "optimizer"]
+        pool = {role: 0 for role in ordered_roles}
         idx = 0
-        while remainder > 0:
+        remaining = capacity
+        while remaining > 0:
             role = ordered_roles[idx % len(ordered_roles)]
             pool[role] += 1
-            remainder -= 1
+            remaining -= 1
             idx += 1
         return pool
 
