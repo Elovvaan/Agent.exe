@@ -1,0 +1,21 @@
+{
+  "last_analysis": {},
+  "applied_adjustments": [],
+  "system_score_trend": [],
+  "agent_learning_signals": [],
+  "task_efficiency": {},
+  "active_controls": {
+    "evaluation_threshold": 0.85,
+    "reasoning_confidence_threshold": 0.7,
+    "weights": {
+      "completeness": 0.4,
+      "description": 0.3,
+      "cta": 0.3
+    },
+    "scoring_modifiers": {
+      "source_changed_penalty": 0.01
+    },
+    "reasoning_confidence_adjustment": 0.0
+  },
+  "updated_at": ""
+}

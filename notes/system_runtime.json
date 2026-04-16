@@ -1,0 +1,13 @@
+{
+  "max_concurrent_tasks": 5,
+  "active_tasks": [],
+  "task_history": [],
+  "agent_utilization": {},
+  "client_priority_map": {},
+  "compute_budget": {
+    "max_units_per_cycle": 100,
+    "used_units": 0
+  },
+  "execution_mode": "balanced",
+  "cycle_history": []
+}
