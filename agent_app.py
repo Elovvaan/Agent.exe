@@ -791,7 +791,8 @@ class AgentApp:
 
     def _execute_task_and_emit_completion(self, task: dict, cycle_state: dict) -> None:
         runtime = cycle_state.get("runtime", {})
-        task_results = self._execute_task_batch_parallel([task], runtime)
+        task_result = self._execute_goal_task_worker(task, runtime)
+        task_results = [task_result] if task_result else []
         if task_results:
             self._persist_runtime_checkpoint("after_task_completion_batch", runtime)
         for result in task_results:
