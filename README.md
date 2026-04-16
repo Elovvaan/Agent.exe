@@ -89,10 +89,10 @@ Then open **Artifacts** → `Agent-windows-bundle`.
 
 ## 8) Phase 13: Internal multi-agent specialization
 - Execution now routes through internal agent roles:
-  - `PLANNER_AGENT` (deterministic step routing)
-  - `GENERATOR_AGENT` (description/CTA proposals)
-  - `EVALUATOR_AGENT` (validation + scoring gate)
-  - `OPTIMIZER_AGENT` (conditional recovery suggestions)
+  - `AGENT_PLANNER` (deterministic step routing)
+  - `AGENT_GENERATOR` (description/CTA proposals)
+  - `AGENT_EVALUATOR` (validation + scoring gate)
+  - `AGENT_OPTIMIZER` (conditional recovery suggestions)
 - Agents are advisory only: truth data, validation rules, and deterministic execution order remain system-controlled.
 - Per-client memory (`clients/<slug>/memory.json`) now tracks `agent_performance`.
 - System learning (`notes/system_learning.json`) now stores agent-level learning signals such as confidence vs accepted outcomes and rejected outputs.
