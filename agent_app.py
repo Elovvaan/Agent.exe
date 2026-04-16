@@ -1999,10 +1999,35 @@ class AgentApp:
         previous_result_values = previous_results.values() if isinstance(previous_results, dict) else ()
         repeated_failure = any(status == "failed" for status in previous_result_values)
         if current_score < float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)) or repeated_failure:
+            evaluator_output = evaluator_summary.get("output", {}) if isinstance(evaluator_summary.get("output", {}), dict) else {}
+            issues_detected = []
+
+            raw_issues = evaluator_output.get("issues_detected", [])
+            if isinstance(raw_issues, list):
+                issues_detected.extend(str(issue) for issue in raw_issues if issue)
+            elif raw_issues:
+                issues_detected.append(str(raw_issues))
+
+            evaluator_issue = evaluator_output.get("issue")
+            if evaluator_issue:
+                issues_detected.append(str(evaluator_issue))
+
+            failed_steps = [
+                f"step_failed:{step_name}"
+                for step_name, status in previous_results.items()
+                if status == "failed"
+            ]
+            issues_detected.extend(failed_steps)
+
+            if not final_evaluator_ok and not issues_detected:
+                issues_detected.append("evaluation_rejected")
+
+            issues_detected = list(dict.fromkeys(issues_detected))
+
             optimizer = self._run_agent(
                 AGENT_OPTIMIZER,
                 current_context,
-                {"evaluation": {"issues_detected": []}},
+                {"evaluation": {"issues_detected": issues_detected}},
             )
             has_suggestions = bool(optimizer.get("output", {}).get("actions", []))
             self._record_agent_performance(final_slug, AGENT_OPTIMIZER, success=has_suggestions)
