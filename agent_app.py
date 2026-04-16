@@ -1764,14 +1764,15 @@ class AgentApp:
         )
         planner_steps = planner_response.get("output", {}).get("selected_steps", [])
         planned = set(planner_steps if isinstance(planner_steps, list) else [])
-        self._record_agent_performance(final_slug, AGENT_PLANNER, success=bool(planned))
+        planner_accepted = bool(planned)
+        self._record_agent_performance(final_slug, AGENT_PLANNER, success=planner_accepted)
         self._record_agent_learning_signal(
             final_slug,
             AGENT_PLANNER,
             float(planner_response.get("confidence", 0.0)),
-            accepted=bool(planned),
-            improved_outcome=True,
-            rejected=not bool(planned),
+            accepted=planner_accepted,
+            improved_outcome=planner_accepted,
+            rejected=not planner_accepted,
         )
 
         for field in ("description", "cta_primary", "cta_secondary"):
