@@ -1579,7 +1579,7 @@ class AgentApp:
                         reasoning_cta_confidence,
                         reasoning_cta_fields,
                         accepted=reasoning_cta_accepted,
-                        fallback_reason=fallback_reason or ("not_needed" if reasoning_cta_accepted else "deterministic_fallback"),
+                        fallback_reason=fallback_reason or ("none" if reasoning_cta_accepted else "deterministic_fallback"),
                     )
 
                 elif step == "RESOLVE_SLUG":
