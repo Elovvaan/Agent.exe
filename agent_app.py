@@ -77,7 +77,11 @@ SUPPORTED_ACTION_TYPES = {
     ACTION_COMMAND,
     ACTION_NO_OP,
 }
-PROTECTED_PATH_MARKERS = ("notes/client.json", "notes/system_learning.json", "config.json")
+PROTECTED_PATH_MARKERS = ("notes/client.json", "notes/system_learning.json", "notes/system_goals.json", "config.json")
+GOAL_STATUS_ACTIVE = "active"
+GOAL_STATUS_COMPLETED = "completed"
+GOAL_STATUS_BLOCKED = "blocked"
+GOAL_FAILURE_ESCALATION_THRESHOLD = 2
 DEFAULT_ACTION_POLICY = {
     "allowed_actions": [ACTION_FILE_WRITE, ACTION_NO_OP],
     "allowed_domains": [],
@@ -282,6 +286,31 @@ class AgentApp:
 
     def _system_learning_file(self) -> Path:
         return self.paths["notes"] / "system_learning.json"
+
+    def _system_goals_file(self) -> Path:
+        return self.paths["notes"] / "system_goals.json"
+
+    def _persist_system_goals(self, payload: dict) -> None:
+        serialized = payload if isinstance(payload, dict) else {"active_goals": []}
+        self._system_goals_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+
+    def _load_active_goals(self) -> list[dict]:
+        goals_file = self._system_goals_file()
+        if not goals_file.exists():
+            default_goals = {"active_goals": []}
+            self._persist_system_goals(default_goals)
+            return default_goals["active_goals"]
+        try:
+            payload = json.loads(goals_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return []
+            goals = payload.get("active_goals", [])
+            if not isinstance(goals, list):
+                return []
+            return [goal for goal in goals if isinstance(goal, dict) and goal.get("status", GOAL_STATUS_ACTIVE) == GOAL_STATUS_ACTIVE]
+        except Exception as exc:
+            self._log_activity(f"[GOAL] failed_to_load_goals error={exc}")
+            return []
 
     def _load_system_learning_state(self) -> None:
         state_file = self._system_learning_file()
@@ -2447,11 +2476,254 @@ class AgentApp:
     def _run_supervisor_cycle(self) -> None:
         self._supervisor_cycle_count += 1
         self._scan_existing_clients()
-        self._evaluate_and_prioritize_clients()
+        self._run_goal_supervisor_cycle()
         if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
             self._run_system_learning_cycle()
         if self._auto_mode:
             self._scan_and_process_inbox()
+
+    def _safe_float(self, value, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _evaluate_goal_progress(self, goal: dict, client_context: dict) -> dict:
+        evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
+        memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
+        target_state = goal.get("target_state", {}) if isinstance(goal.get("target_state", {}), dict) else {}
+
+        target_score = self._safe_float(target_state.get("overall_score", 0.9), 0.9)
+        current_score = self._safe_float(evaluation.get("overall_score", 0.0), 0.0)
+        unresolved_issues = evaluation.get("issues_detected", []) if isinstance(evaluation.get("issues_detected", []), list) else []
+
+        progress_ratio = min(1.0, current_score / max(target_score, 0.01))
+        progress_percent = round(progress_ratio * 100, 1)
+        score_gap = round(max(0.0, target_score - current_score), 3)
+
+        action_history = memory.get("action_history", [])
+        if not isinstance(action_history, list):
+            action_history = []
+        executed = [entry for entry in action_history if isinstance(entry, dict) and entry.get("stage") == "executed"]
+
+        execution_results = memory.get("execution_results", [])
+        if not isinstance(execution_results, list):
+            execution_results = []
+
+        recent_execution_results = [entry for entry in execution_results if isinstance(entry, dict)][-8:]
+        recent_executed = recent_execution_results or executed[-8:]
+        failed_exec = []
+        for entry in recent_executed:
+            status = None
+            if isinstance(entry.get("result", {}), dict):
+                status = entry.get("result", {}).get("status")
+            if status is None:
+                status = entry.get("status")
+            if status in {"failed", "rejected"}:
+                failed_exec.append(entry)
+
+        if recent_executed:
+            effectiveness = round((len(recent_executed) - len(failed_exec)) / len(recent_executed), 2)
+        else:
+            effectiveness = 1.0
+        repeated_failure = bool(recent_executed) and len(failed_exec) >= GOAL_FAILURE_ESCALATION_THRESHOLD
+        next_needed_actions: list[str] = []
+        if score_gap > 0:
+            next_needed_actions.append("improve_quality_score")
+        if unresolved_issues:
+            next_needed_actions.append("resolve_unresolved_issues")
+        if effectiveness < 0.5:
+            next_needed_actions.append("revise_action_strategy")
+        if repeated_failure:
+            next_needed_actions.append("escalate_execution_tier")
+
+        blocked = bool(repeated_failure and unresolved_issues)
+        complete = bool(current_score >= target_score and not unresolved_issues)
+        return {
+            "progress_percent": progress_percent,
+            "blocked": blocked,
+            "complete": complete,
+            "current_score": current_score,
+            "target_score": target_score,
+            "score_gap": score_gap,
+            "unresolved_issues": unresolved_issues,
+            "action_history_effectiveness": effectiveness,
+            "repeated_failure": repeated_failure,
+            "next_needed_actions": next_needed_actions,
+        }
+
+    def _plan_goal_actions(self, goal: dict, client_context: dict, progress: dict) -> dict:
+        slug = str(goal.get("client_slug", "")).strip()
+        evaluation = client_context.get("evaluation", {}) if isinstance(client_context.get("evaluation", {}), dict) else {}
+        memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
+        unresolved = progress.get("unresolved_issues", []) if isinstance(progress.get("unresolved_issues", []), list) else []
+
+        requested = ["ENRICH_DATA", "GENERATE_DESCRIPTION", "GENERATE_CTA", "RESOLVE_SLUG", "PROCEED_TO_BUILD"]
+        planner = self._run_agent(
+            AGENT_PLANNER,
+            client_context,
+            {
+                "requested_plan": requested,
+                "objective": goal.get("objective", ""),
+                "evaluation": evaluation,
+                "failure_history": memory.get("execution_results", {}),
+            },
+        )
+        selected_steps = planner.get("output", {}).get("selected_steps", [])
+        if not isinstance(selected_steps, list):
+            selected_steps = []
+
+        escalation = {
+            "tier": "standard",
+            "optimizer_actions": [],
+            "strategy_shift": "none",
+        }
+        if progress.get("repeated_failure", False):
+            optimizer = self._run_agent(
+                AGENT_OPTIMIZER,
+                client_context,
+                {"evaluation": evaluation, "objective": goal.get("objective", ""), "issues": unresolved},
+            )
+            optimizer_actions = optimizer.get("output", {}).get("actions", [])
+            if not isinstance(optimizer_actions, list):
+                optimizer_actions = []
+            escalation = {
+                "tier": "advanced",
+                "optimizer_actions": optimizer_actions,
+                "strategy_shift": "failure_recovery",
+            }
+            if "PROCEED_TO_BUILD" not in selected_steps:
+                selected_steps.append("PROCEED_TO_BUILD")
+
+        safeguards = {
+            "respect_action_policy": True,
+            "respect_validation_layer": True,
+            "deny_protected_paths_override": True,
+        }
+        return {
+            "goal_id": goal.get("goal_id", ""),
+            "client_slug": slug,
+            "planner_steps": selected_steps,
+            "next_needed_actions": progress.get("next_needed_actions", []),
+            "issues": unresolved,
+            "escalation": escalation,
+            "safety_constraints": safeguards,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _update_goal_record(self, goal_id: str, updates: dict) -> None:
+        goals_file = self._system_goals_file()
+        if not goals_file.exists():
+            return
+        try:
+            payload = json.loads(goals_file.read_text(encoding="utf-8"))
+            goals = payload.get("active_goals", []) if isinstance(payload, dict) else []
+            if not isinstance(goals, list):
+                return
+            changed = False
+            for idx, goal in enumerate(goals):
+                if isinstance(goal, dict) and goal.get("goal_id") == goal_id:
+                    merged = dict(goal)
+                    merged.update(updates)
+                    goals[idx] = merged
+                    changed = True
+                    break
+            if changed:
+                payload["active_goals"] = goals
+                self._persist_system_goals(payload)
+        except Exception as exc:
+            self._log_activity(f"[GOAL] failed_to_update_goal_record goal_id={goal_id} error={exc}")
+
+    def _run_goal_supervisor_cycle(self) -> None:
+        active_goals = self._load_active_goals()
+        if not active_goals:
+            return
+
+        for goal in active_goals:
+            goal_id = str(goal.get("goal_id", ""))
+            slug = str(goal.get("client_slug", "")).strip()
+            if not slug:
+                self._log_activity(f"[GOAL] skipped goal_id={goal_id} reason=missing_client_slug")
+                continue
+            if not (self.paths["clients"] / slug).exists():
+                self._log_activity(f"[GOAL] skipped goal_id={goal_id} slug={slug} reason=missing_client")
+                continue
+
+            evaluation = self._evaluate_client_state(slug)
+            self._persist_client_evaluation(slug, evaluation)
+            client_context = self._build_client_context(slug)
+            client_context["evaluation"] = evaluation
+            progress = self._evaluate_goal_progress(goal, client_context)
+            now = datetime.now().isoformat(timespec="seconds")
+
+            if progress["complete"]:
+                self._update_goal_record(
+                    goal_id,
+                    {
+                        "status": GOAL_STATUS_COMPLETED,
+                        "completion_state": "target_met",
+                        "progress": 100,
+                        "last_run": now,
+                        "completed_at": now,
+                    },
+                )
+                self._record_agent_learning_signal(
+                    slug,
+                    "GOAL_COMPLETION",
+                    1.0,
+                    accepted=True,
+                    improved_outcome=True,
+                    rejected=False,
+                )
+                self._persist_system_learning_state()
+                self._log_activity(f"[GOAL] completed goal_id={goal_id} slug={slug} score={progress['current_score']:.2f}")
+                continue
+
+            plan = self._plan_goal_actions(goal, client_context, progress)
+            status = GOAL_STATUS_ACTIVE
+            completion_state = "in_progress"
+            run_result = "planned"
+            try:
+                reason = (
+                    f"goal_id={goal_id};objective={goal.get('objective', '')};"
+                    f"progress={progress['progress_percent']};blocked={progress['blocked']};"
+                    f"actions={','.join(progress.get('next_needed_actions', [])) or 'none'}"
+                )
+                self._schedule_client_supervisor_work(slug, reason)
+                run_result = "executed"
+            except Exception as exc:
+                run_result = f"failed:{exc}"
+                status = GOAL_STATUS_BLOCKED if progress.get("blocked", False) else GOAL_STATUS_ACTIVE
+                completion_state = "execution_failed"
+                self._log_activity(f"[GOAL] execution_failed goal_id={goal_id} slug={slug} error={exc}")
+
+            if progress.get("repeated_failure", False):
+                completion_state = "escalated_recovery"
+                status = GOAL_STATUS_BLOCKED if progress.get("blocked", False) else status
+
+            self._update_goal_record(
+                goal_id,
+                {
+                    "progress": progress["progress_percent"],
+                    "status": status,
+                    "blocked": progress["blocked"],
+                    "last_run": now,
+                    "completion_state": completion_state,
+                    "last_evaluation": {
+                        "current_score": progress["current_score"],
+                        "target_score": progress["target_score"],
+                        "score_gap": progress["score_gap"],
+                        "unresolved_issues": progress["unresolved_issues"],
+                        "action_history_effectiveness": progress["action_history_effectiveness"],
+                    },
+                    "last_plan": plan,
+                    "last_result": run_result,
+                },
+            )
+            self._log_activity(
+                f"[GOAL] cycle goal_id={goal_id} slug={slug} progress={progress['progress_percent']} "
+                f"blocked={progress['blocked']} result={run_result} tier={plan.get('escalation', {}).get('tier', 'standard')}"
+            )
 
     def _evaluate_and_prioritize_clients(self) -> None:
         clients = self._discover_clients()
