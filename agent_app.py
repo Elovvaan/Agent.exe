@@ -43,10 +43,11 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
     "{{CTA_SECONDARY}}",
 )
 INTELLIGENCE_PROFILE_FILENAME = "intelligence_profile.json"
+SAFE_DESCRIPTION_FALLBACK_TEMPLATE = "Welcome to {name}. We provide quality services to our clients."
 DEFAULT_INTELLIGENCE_PROFILE = {
     "business_type_default": "Local Business",
     "brand_style_default": "modern and professional",
-    "description_template": "Welcome to {name}. We provide quality services to our clients.",
+    "description_template": SAFE_DESCRIPTION_FALLBACK_TEMPLATE,
     "cta_primary_default": "Book a free call",
     "cta_secondary_default": "See our services",
 }
@@ -560,13 +561,13 @@ class AgentApp:
             description = template.format(name=name)
         except (KeyError, ValueError) as exc:
             self._log_activity(
-                "[PROFILE] invalid description template %r (expected placeholder {name}); using default: %s"
-                % (template, exc)
+                f"[PROFILE] invalid description template '{template}' "
+                f"(expected placeholder {{name}}); trying default template: {exc}"
             )
             try:
                 description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
             except (KeyError, ValueError):
-                description = f"Welcome to {name}. We provide quality services to our clients."
+                description = SAFE_DESCRIPTION_FALLBACK_TEMPLATE.format(name=name)
         return description
 
     # ------------------------------------------------------------------ #
