@@ -723,6 +723,45 @@ class AgentApp:
         )
         return all(bool(str(client_data.get(field, "")).strip()) for field in required_fields)
 
+    def _load_client_memory(self, slug: str) -> dict:
+        """Load structured memory for a client; return empty shape if unavailable."""
+        memory_file = self.paths["clients"] / slug / "memory.json"
+        empty_memory = {
+            "last_action_plan": [],
+            "execution_results": {},
+            "generated_fields": {},
+            "timestamp": "",
+        }
+        if not memory_file.exists():
+            return empty_memory
+        try:
+            data = json.loads(memory_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return empty_memory
+            return {
+                "last_action_plan": data.get("last_action_plan", []),
+                "execution_results": data.get("execution_results", {}),
+                "generated_fields": data.get("generated_fields", {}),
+                "timestamp": data.get("timestamp", ""),
+            }
+        except Exception as exc:
+            self._log_activity(f"[MEMORY] load failed slug={slug}: {exc}")
+            return empty_memory
+
+    def _update_client_memory(self, slug: str, data: dict) -> None:
+        """Persist structured memory for a client."""
+        client_root = self.paths["clients"] / slug
+        client_root.mkdir(parents=True, exist_ok=True)
+        memory_file = client_root / "memory.json"
+        payload = {
+            "last_action_plan": data.get("last_action_plan", []),
+            "execution_results": data.get("execution_results", {}),
+            "generated_fields": data.get("generated_fields", {}),
+            "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
+        }
+        memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._log_activity(f"[MEMORY] updated slug={slug} path={memory_file}")
+
     def _execute_action_plan(self, client_analysis: ClientAnalysis) -> dict:
         """
         Execute analysis.action_plan in strict deterministic order (no parallelism).
@@ -747,6 +786,15 @@ class AgentApp:
         client_data = client_analysis.to_dict()
         final_slug = client_analysis.slug
         copied = 0
+        previous_memory = self._load_client_memory(final_slug)
+        previous_generated = previous_memory.get("generated_fields", {})
+        previous_results = previous_memory.get("execution_results", {})
+        execution_results: dict[str, str] = {}
+
+        for field in ("description", "cta_primary", "cta_secondary"):
+            if not str(client_data.get(field, "")).strip() and str(previous_generated.get(field, "")).strip():
+                client_data[field] = previous_generated[field]
+                self._log_activity(f"[MEMORY] preload field={field} slug={final_slug}")
 
         for step in ordered_steps:
             if step not in planned:
@@ -762,16 +810,37 @@ class AgentApp:
 
                 elif step == "GENERATE_DESCRIPTION":
                     if not client_data.get("description", "").strip():
-                        client_data["description"] = (
-                            f"Welcome to {client_data['name']}. "
-                            "We provide quality services to our clients."
-                        )
+                        if (
+                            previous_results.get("GENERATE_DESCRIPTION") == "success"
+                            and str(previous_generated.get("description", "")).strip()
+                        ):
+                            client_data["description"] = previous_generated["description"]
+                            self._log_activity(f"[MEMORY] reused description slug={final_slug}")
+                        else:
+                            client_data["description"] = (
+                                f"Welcome to {client_data['name']}. "
+                                "We provide quality services to our clients."
+                            )
 
                 elif step == "GENERATE_CTA":
                     if not client_data.get("cta_primary", "").strip():
-                        client_data["cta_primary"] = "Book a free call"
+                        if (
+                            previous_results.get("GENERATE_CTA") == "success"
+                            and str(previous_generated.get("cta_primary", "")).strip()
+                        ):
+                            client_data["cta_primary"] = previous_generated["cta_primary"]
+                            self._log_activity(f"[MEMORY] reused cta_primary slug={final_slug}")
+                        else:
+                            client_data["cta_primary"] = "Book a free call"
                     if not client_data.get("cta_secondary", "").strip():
-                        client_data["cta_secondary"] = "See our services"
+                        if (
+                            previous_results.get("GENERATE_CTA") == "success"
+                            and str(previous_generated.get("cta_secondary", "")).strip()
+                        ):
+                            client_data["cta_secondary"] = previous_generated["cta_secondary"]
+                            self._log_activity(f"[MEMORY] reused cta_secondary slug={final_slug}")
+                        else:
+                            client_data["cta_secondary"] = "See our services"
 
                 elif step == "RESOLVE_SLUG":
                     final_slug = self._resolve_unique_slug(final_slug)
@@ -786,8 +855,10 @@ class AgentApp:
                     copied = self._run_site_generation(client_root, client_data)
 
                 self._log_activity(f"[ACTION] {step} status=success")
+                execution_results[step] = "success"
             except Exception:
                 self._log_activity(f"[ACTION] {step} status=failed")
+                execution_results[step] = "failed"
                 raise
 
         updated_analysis = ClientAnalysis(
@@ -812,6 +883,7 @@ class AgentApp:
             "client_data": client_data,
             "client_root": self.paths["clients"] / final_slug,
             "copied": copied,
+            "execution_results": execution_results,
         }
 
     def generate_site(self):
@@ -821,6 +893,14 @@ class AgentApp:
             return
         try:
             raw_data = self._read_client_data(client_root)
+            inferred_slug = self.sanitize_client_name(str(raw_data.get("name", "")))
+            existing_memory = self._load_client_memory(inferred_slug)
+            generated_fields = existing_memory.get("generated_fields", {})
+            for field in ("description", "cta_primary", "cta_secondary"):
+                if not str(raw_data.get(field, "")).strip() and str(generated_fields.get(field, "")).strip():
+                    raw_data[field] = generated_fields[field]
+                    self._log_activity(f"[MEMORY] preloaded raw field={field} slug={inferred_slug}")
+
             analysis = self._analyze_client(raw_data)
             self._log_analysis(analysis, self.selected_client or "manual")
             copied = self._run_site_generation(client_root, analysis.to_dict())
@@ -975,6 +1055,14 @@ class AgentApp:
             with client_json_path.open("r", encoding="utf-8") as f:
                 raw_data = json.load(f)
 
+            inferred_slug = self.sanitize_client_name(str(raw_data.get("name", "")))
+            existing_memory = self._load_client_memory(inferred_slug)
+            generated_fields = existing_memory.get("generated_fields", {})
+            for field in ("description", "cta_primary", "cta_secondary"):
+                if not str(raw_data.get(field, "")).strip() and str(generated_fields.get(field, "")).strip():
+                    raw_data[field] = generated_fields[field]
+                    self._log_activity(f"[MEMORY] preloaded raw field={field} slug={inferred_slug}")
+
             # 2. Decision layer: validate, enrich, normalize
             analysis = self._analyze_client(raw_data)
 
@@ -984,6 +1072,7 @@ class AgentApp:
             client_data: dict = execution["client_data"]
             client_root: Path = execution["client_root"]
             copied: int = execution["copied"]
+            execution_results: dict = execution.get("execution_results", {})
 
             # 4. Persist structured analysis and normalized client data
             self._log_analysis(final_analysis, job_name)
@@ -992,6 +1081,20 @@ class AgentApp:
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
             notes_file = client_root / "notes" / "client.json"
             notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+
+            self._update_client_memory(
+                final_analysis.slug,
+                {
+                    "last_action_plan": final_analysis.action_plan,
+                    "execution_results": execution_results,
+                    "generated_fields": {
+                        "description": client_data.get("description", ""),
+                        "cta_primary": client_data.get("cta_primary", ""),
+                        "cta_secondary": client_data.get("cta_secondary", ""),
+                    },
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
 
             # 5. Copy any assets bundled with the job
             job_assets = job_dir / "assets"
