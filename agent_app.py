@@ -252,6 +252,10 @@ class AgentApp:
             "system_score_trend": [],
             "agent_learning_signals": [],
             "task_efficiency": {},
+            "verification_metrics": {
+                "task_type": {},
+                "agent_role": {},
+            },
         }
         self._system_runtime_state = {
             "max_concurrent_tasks": 5,
@@ -447,6 +451,13 @@ class AgentApp:
             self._system_learning_state["system_score_trend"] = payload.get("system_score_trend", [])
             self._system_learning_state["agent_learning_signals"] = payload.get("agent_learning_signals", [])
             self._system_learning_state["task_efficiency"] = payload.get("task_efficiency", {}) if isinstance(payload.get("task_efficiency", {}), dict) else {}
+            verification_metrics = payload.get("verification_metrics", {})
+            if not isinstance(verification_metrics, dict):
+                verification_metrics = {}
+            self._system_learning_state["verification_metrics"] = {
+                "task_type": verification_metrics.get("task_type", {}) if isinstance(verification_metrics.get("task_type", {}), dict) else {},
+                "agent_role": verification_metrics.get("agent_role", {}) if isinstance(verification_metrics.get("agent_role", {}), dict) else {},
+            }
             controls = payload.get("active_controls", {})
             if isinstance(controls, dict):
                 self._learning_controls["evaluation_threshold"] = float(
@@ -478,6 +489,7 @@ class AgentApp:
             "system_score_trend": self._system_learning_state.get("system_score_trend", [])[-50:],
             "agent_learning_signals": self._system_learning_state.get("agent_learning_signals", [])[-200:],
             "task_efficiency": self._system_learning_state.get("task_efficiency", {}),
+            "verification_metrics": self._system_learning_state.get("verification_metrics", {}),
             "active_controls": self._learning_controls,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -2395,7 +2407,16 @@ class AgentApp:
         payload = action.get("payload", {})
 
         if action_type == ACTION_NO_OP:
-            return {"status": "skipped", "details": "no_op"}
+            return {
+                "status": "skipped",
+                "details": "no_op",
+                "action_type": ACTION_NO_OP,
+                "verifiable_result": {
+                    "type": ACTION_COMMAND,
+                    "exit_code": 0,
+                    "output_valid": True,
+                },
+            }
 
         if action_type == ACTION_FILE_WRITE:
             output_root = (self.paths["clients"] / slug / "safe_outputs").resolve()
@@ -2407,14 +2428,56 @@ class AgentApp:
                 return {"status": "failed", "details": "file_write_outside_safe_outputs"}
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            return {"status": "success", "details": f"wrote:{target_path}"}
+            checksum = hashlib.sha256(target_path.read_bytes()).hexdigest()
+            return {
+                "status": "success",
+                "details": f"wrote:{target_path}",
+                "action_type": ACTION_FILE_WRITE,
+                "verifiable_result": {
+                    "type": ACTION_FILE_WRITE,
+                    "file_path": str(target_path),
+                    "checksum": checksum,
+                },
+            }
 
         if action_type in {ACTION_API_CALL, ACTION_WEBHOOK}:
             body = json.dumps(payload if isinstance(payload, dict) else {"payload": payload}).encode("utf-8")
             req = Request(target, data=body, headers={"Content-Type": "application/json"}, method="POST")
             with urlopen(req, timeout=8) as resp:
                 response_code = getattr(resp, "status", 200)
-            return {"status": "success", "details": f"http_status:{response_code}"}
+                response_body = resp.read().decode("utf-8", errors="replace")
+            parsed_response = {}
+            try:
+                parsed = json.loads(response_body) if response_body else {}
+                if isinstance(parsed, dict):
+                    parsed_response = parsed
+            except Exception:
+                parsed_response = {}
+            if action_type == ACTION_WEBHOOK:
+                return {
+                    "status": "success",
+                    "details": f"http_status:{response_code}",
+                    "action_type": ACTION_WEBHOOK,
+                    "verifiable_result": {
+                        "type": ACTION_WEBHOOK,
+                        "response_status": response_code,
+                        "delivery_confirmed": response_code in {200, 201, 202, 204},
+                    },
+                }
+            expected_fields = payload.get("expected_fields", []) if isinstance(payload, dict) else []
+            if not isinstance(expected_fields, list):
+                expected_fields = []
+            return {
+                "status": "success",
+                "details": f"http_status:{response_code}",
+                "action_type": ACTION_API_CALL,
+                "verifiable_result": {
+                    "type": ACTION_API_CALL,
+                    "response_status": response_code,
+                    "expected_fields": [str(field) for field in expected_fields if str(field).strip()],
+                    "response_data": parsed_response,
+                },
+            }
 
         if action_type == ACTION_COMMAND:
             command = payload.get("command", []) if isinstance(payload, dict) else []
@@ -2430,6 +2493,12 @@ class AgentApp:
             return {
                 "status": "success" if completed.returncode == 0 else "failed",
                 "details": f"returncode:{completed.returncode}",
+                "action_type": ACTION_COMMAND,
+                "verifiable_result": {
+                    "type": ACTION_COMMAND,
+                    "exit_code": completed.returncode,
+                    "output_valid": bool((completed.stdout or "").strip()),
+                },
             }
 
         return {"status": "failed", "details": "unsupported_action_runtime"}
@@ -2496,6 +2565,27 @@ class AgentApp:
                 self._log_activity(
                     f"[ACTION] failed slug={slug} type={action.get('type')} error={exc}"
                 )
+
+            verification = self._verify_task_outcome(
+                {"task_type": str(action.get("type", "")).strip().upper(), "assigned_agent": "optimizer"},
+                result,
+            )
+            result["verification"] = verification
+            action_task_type = str(action.get("type", "")).strip().upper() or "unknown"
+            verification_passed = bool(verification.get("passed", False))
+            if not verification_passed and result.get("status") == "success":
+                result["status"] = "false_success"
+                result["details"] = f"{result.get('details', '')}|verification_failed:{verification.get('reason', 'unknown')}"
+                self._log_activity(
+                    f"[ACTION] false_success slug={slug} type={action_task_type} reason={verification.get('reason', 'unknown')}"
+                )
+            elif verification_passed:
+                result["execution_pattern_reinforced"] = True
+                self._log_activity(
+                    f"[ACTION] verification_passed slug={slug} type={action_task_type} action=reinforce_execution_pattern"
+                )
+            self._update_verification_metrics(action_task_type, "optimizer", verification_passed)
+            self._persist_system_learning_state()
             self._append_action_history(
                 slug,
                 {
@@ -3122,7 +3212,40 @@ class AgentApp:
         if not isinstance(history, list):
             history = []
         finalized = dict(task)
-        finalized["status"] = TASK_STATUS_COMPLETED if result.get("status") == "success" else TASK_STATUS_FAILED
+        task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+        role = str(task.get("assigned_agent", "")).strip() or "unknown"
+        verification = self._verify_task_outcome(task, result)
+        result["verification"] = verification
+        verification_passed = bool(verification.get("passed", False))
+        if not verification_passed:
+            result["status"] = "false_success" if result.get("status") == "success" else "failed"
+            result["route_to_optimizer"] = True
+            task["repeated_failure"] = True
+            runtime_priority = runtime.setdefault("client_priority_map", {})
+            slug_key = str(task.get("client_slug", "")).strip()
+            if slug_key:
+                runtime_priority[slug_key] = min(100.0, self._safe_float(runtime_priority.get(slug_key, 0.0), 0.0) + 5.0)
+            efficiency = self._system_learning_state.setdefault("task_efficiency", {})
+            stats = efficiency.setdefault(task_type, {}) if isinstance(efficiency, dict) else {}
+            if isinstance(stats, dict):
+                baseline = self._safe_float(stats.get("success_rate", 0.5), 0.5)
+                stats["success_rate"] = round(max(0.0, baseline - 0.05), 3)
+            self._log_activity(
+                f"[TASK] false_success task_id={task_id} role={role} reason={verification.get('reason', 'unknown')} route=optimizer"
+            )
+        else:
+            result["task_type_confidence_boost"] = 0.03
+            result["execution_pattern_reinforced"] = True
+            efficiency = self._system_learning_state.setdefault("task_efficiency", {})
+            stats = efficiency.setdefault(task_type, {}) if isinstance(efficiency, dict) else {}
+            if isinstance(stats, dict):
+                baseline = self._safe_float(stats.get("value_return", 0.5), 0.5)
+                stats["value_return"] = round(min(1.0, baseline + 0.03), 3)
+
+        self._update_verification_metrics(task_type, role, verification_passed)
+        self._persist_system_learning_state()
+
+        finalized["status"] = TASK_STATUS_COMPLETED if verification_passed and result.get("status") == "success" else TASK_STATUS_FAILED
         finalized["completed_at"] = datetime.now().isoformat(timespec="seconds")
         finalized["result"] = result
         finalized["cost_estimate"] = task.get("cost_estimate", {})
@@ -3198,6 +3321,97 @@ class AgentApp:
         }
         self._system_learning_state["task_efficiency"] = efficiency
         self._persist_system_learning_state()
+
+    def _update_verification_metrics(self, task_type: str, role: str, passed: bool) -> None:
+        metrics = self._system_learning_state.get("verification_metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+
+        task_nodes = metrics.get("task_type", {})
+        if not isinstance(task_nodes, dict):
+            task_nodes = {}
+        task_key = task_type or "unknown"
+        task_stats = task_nodes.get(task_key, {})
+        if not isinstance(task_stats, dict):
+            task_stats = {}
+        task_total = max(0, int(task_stats.get("total", 0))) + 1
+        task_pass = max(0, int(task_stats.get("passed", 0))) + (1 if passed else 0)
+        task_stats["total"] = task_total
+        task_stats["passed"] = task_pass
+        task_stats["verification_pass_rate"] = round(task_pass / max(1, task_total), 3)
+        task_nodes[task_key] = task_stats
+
+        role_nodes = metrics.get("agent_role", {})
+        if not isinstance(role_nodes, dict):
+            role_nodes = {}
+        role_key = role or "unknown"
+        role_stats = role_nodes.get(role_key, {})
+        if not isinstance(role_stats, dict):
+            role_stats = {}
+        role_total = max(0, int(role_stats.get("total", 0))) + 1
+        role_false_success = max(0, int(role_stats.get("false_success", 0))) + (0 if passed else 1)
+        role_stats["total"] = role_total
+        role_stats["false_success"] = role_false_success
+        role_stats["false_success_rate"] = round(role_false_success / max(1, role_total), 3)
+        role_nodes[role_key] = role_stats
+
+        metrics["task_type"] = task_nodes
+        metrics["agent_role"] = role_nodes
+        self._system_learning_state["verification_metrics"] = metrics
+
+    def _verify_task_outcome(self, task: dict, result: dict) -> dict:
+        verifiable = result.get("verifiable_result")
+        if not isinstance(verifiable, dict):
+            return {"passed": False, "reason": "missing_verifiable_result"}
+
+        verification_type = str(verifiable.get("type", result.get("action_type", ""))).strip().upper()
+        if verification_type == ACTION_FILE_WRITE:
+            path_value = str(verifiable.get("file_path", "")).strip()
+            expected_checksum = str(verifiable.get("checksum", "")).strip()
+            if not path_value or not expected_checksum:
+                return {"passed": False, "reason": "missing_file_verification_fields"}
+            file_path = Path(path_value)
+            if not file_path.exists() or not file_path.is_file():
+                return {"passed": False, "reason": "file_not_found"}
+            digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+            if digest != expected_checksum:
+                return {"passed": False, "reason": "checksum_mismatch"}
+            return {"passed": True, "reason": "file_exists_and_checksum_valid"}
+
+        if verification_type == ACTION_API_CALL:
+            status_code = int(self._safe_float(verifiable.get("response_status", 0), 0.0))
+            expected_fields = verifiable.get("expected_fields", [])
+            response_data = verifiable.get("response_data", {})
+            if not isinstance(expected_fields, list):
+                expected_fields = []
+            if not isinstance(response_data, dict):
+                response_data = {}
+            missing = [field for field in expected_fields if str(field) not in response_data]
+            if status_code < 200 or status_code >= 300:
+                return {"passed": False, "reason": "api_status_not_success"}
+            if missing:
+                return {"passed": False, "reason": f"api_missing_fields:{','.join(missing)}"}
+            return {"passed": True, "reason": "api_status_and_fields_valid"}
+
+        if verification_type == ACTION_WEBHOOK:
+            status_code = int(self._safe_float(verifiable.get("response_status", 0), 0.0))
+            delivered = bool(verifiable.get("delivery_confirmed", False))
+            if status_code < 200 or status_code >= 300:
+                return {"passed": False, "reason": "webhook_status_not_success"}
+            if not delivered:
+                return {"passed": False, "reason": "webhook_delivery_not_confirmed"}
+            return {"passed": True, "reason": "webhook_delivery_confirmed"}
+
+        if verification_type == ACTION_COMMAND:
+            exit_code = int(self._safe_float(verifiable.get("exit_code", -1), -1.0))
+            output_valid = bool(verifiable.get("output_valid", False))
+            if exit_code != 0:
+                return {"passed": False, "reason": "command_exit_nonzero"}
+            if not output_valid:
+                return {"passed": False, "reason": "command_output_invalid"}
+            return {"passed": True, "reason": "command_exit_and_output_valid"}
+
+        return {"passed": False, "reason": "unsupported_verification_type"}
 
     def _update_compute_usage(self, task: dict, result: dict, runtime: dict) -> None:
         units = result.get("compute_units_used", {}) if isinstance(result.get("compute_units_used", {}), dict) else {}
@@ -3435,6 +3649,11 @@ class AgentApp:
                 "status": "success" if run_result in {"executed", "skipped"} else "failed",
                 "run_result": run_result,
                 "compute_units_used": compute_units,
+                "verifiable_result": {
+                    "type": ACTION_COMMAND,
+                    "exit_code": 0 if run_result in {"executed", "skipped"} else 1,
+                    "output_valid": run_result in {"executed", "skipped"},
+                },
             }
             self._log_task_complete(task, completion, runtime)
             self._log_activity(
