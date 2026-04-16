@@ -77,7 +77,7 @@ SUPPORTED_ACTION_TYPES = {
     ACTION_COMMAND,
     ACTION_NO_OP,
 }
-PROTECTED_PATH_MARKERS = ("notes/client.json", "notes/system_learning.json", "config.json")
+PROTECTED_PATH_MARKERS = ("notes/client.json", "notes/system_learning.json", "notes/system_goals.json", "config.json")
 GOAL_STATUS_ACTIVE = "active"
 GOAL_STATUS_COMPLETED = "completed"
 GOAL_STATUS_BLOCKED = "blocked"
