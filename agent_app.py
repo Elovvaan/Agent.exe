@@ -560,9 +560,13 @@ class AgentApp:
             description = template.format(name=name)
         except (KeyError, ValueError) as exc:
             self._log_activity(
-                f"[PROFILE] invalid description template '{template}' (expected placeholder '{{name}}'); using default: {exc}"
+                "[PROFILE] invalid description template %r (expected placeholder {name}); using default: %s"
+                % (template, exc)
             )
-            description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
+            try:
+                description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
+            except (KeyError, ValueError):
+                description = f"Welcome to {name}. We provide quality services to our clients."
         return description
 
     # ------------------------------------------------------------------ #
