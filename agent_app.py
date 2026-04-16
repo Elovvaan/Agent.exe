@@ -540,7 +540,7 @@ class AgentApp:
 
         return escape(value, quote=True)
 
-    def _analyze_client(self, raw: dict) -> ClientAnalysis:
+    def _analyze_client(self, raw: dict, context: dict | None = None) -> ClientAnalysis:
         """
         Decision layer: validate, enrich, and normalize raw client data.
 
@@ -551,6 +551,9 @@ class AgentApp:
         """
         enriched: list[str] = []
         warnings: list[str] = []
+        context = context or {}
+        profile = context.get("profile", {}) if isinstance(context.get("profile", {}), dict) else {}
+        profile_defaults = profile.get("defaults", {}) if isinstance(profile.get("defaults", {}), dict) else {}
 
         def _raw_text(key: str) -> str:
             value = raw.get(key, "")
@@ -570,13 +573,21 @@ class AgentApp:
         # ---- business_type ----
         business_type = _raw_text("business_type").strip()
         if not business_type:
-            business_type = "Local Business"
+            business_type = str(
+                profile_defaults.get("business_type")
+                or profile.get("business_type")
+                or "Local Business"
+            ).strip()
             enriched.append("business_type")
 
         # ---- brand_style ----
         brand_style = _raw_text("brand_style").strip()
         if not brand_style:
-            brand_style = "modern and professional"
+            brand_style = str(
+                profile_defaults.get("brand_style")
+                or profile.get("brand_style")
+                or "modern and professional"
+            ).strip()
             enriched.append("brand_style")
 
         # ---- email (normalize: lowercase + stripped) ----
@@ -607,13 +618,21 @@ class AgentApp:
         # ---- cta_primary ----
         cta_primary = _raw_text("cta_primary").strip()
         if not cta_primary:
-            cta_primary = "Book a free call"
+            cta_primary = str(
+                profile_defaults.get("cta_primary")
+                or profile.get("cta_primary")
+                or "Book a free call"
+            ).strip()
             enriched.append("cta_primary")
 
         # ---- cta_secondary ----
         cta_secondary = _raw_text("cta_secondary").strip()
         if not cta_secondary:
-            cta_secondary = "See our services"
+            cta_secondary = str(
+                profile_defaults.get("cta_secondary")
+                or profile.get("cta_secondary")
+                or "See our services"
+            ).strip()
             enriched.append("cta_secondary")
 
         # ---- completeness score (measured against raw input, before enrichment) ----
@@ -732,6 +751,143 @@ class AgentApp:
         )
         return all(bool(str(client_data.get(field, "")).strip()) for field in required_fields)
 
+    def _safe_read_json_dict(self, path: Path, label: str) -> tuple[dict, str]:
+        if not path.exists():
+            return {}, "missing"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                self._log_activity(f"[CONTEXT] ignored {label}: expected object got {type(data).__name__}")
+                return {}, "invalid"
+            return data, "ok"
+        except Exception as exc:
+            self._log_activity(f"[CONTEXT] ignored {label}: {exc}")
+            return {}, "invalid"
+
+    def _build_client_context(self, slug: str, raw_client_data: dict | None = None) -> dict:
+        client_root = self.paths["clients"] / slug
+        notes_file = client_root / "notes" / "client.json"
+        profile_file = client_root / "notes" / "intelligence_profile.json"
+        included_sources: list[str] = []
+
+        identity: dict = {}
+        raw_input = raw_client_data if isinstance(raw_client_data, dict) else {}
+        if raw_input:
+            identity = {"slug": slug, "name": str(raw_input.get("name", "")).strip()}
+
+        skip_disk_sources = bool(
+            raw_input and client_root.exists() and raw_input.get("overwrite") is not True
+        )
+        if skip_disk_sources:
+            self._log_activity(
+                f"[CONTEXT] skipped disk-backed sources for {slug}: existing client root detected "
+                "while building context for inbound data without overwrite"
+            )
+            truth_data, truth_status = {}, "skipped"
+            profile_data, profile_status = {}, "skipped"
+            memory = {}
+        else:
+            truth_data, truth_status = self._safe_read_json_dict(notes_file, f"{slug}:notes/client.json")
+            if truth_status == "ok":
+                included_sources.append("truth")
+                identity["name"] = str(truth_data.get("name", identity.get("name", ""))).strip()
+
+            profile_data, profile_status = self._safe_read_json_dict(
+                profile_file, f"{slug}:notes/intelligence_profile.json"
+            )
+            if profile_status == "ok":
+                included_sources.append("profile")
+
+            memory = self._load_client_memory(slug)
+            included_sources.append("memory")
+        evaluation = memory.get("last_evaluation", {})
+        stable = bool(memory.get("stable", False))
+        frozen = bool(profile_data.get("freeze", False) or memory.get("freeze", False))
+
+        generated_fields = memory.get("generated_fields", {})
+        execution_results = memory.get("execution_results", {})
+        reusable_generated: dict[str, str] = {}
+        for field in ("description", "cta_primary", "cta_secondary"):
+            value = str(generated_fields.get(field, "")).strip()
+            if not value:
+                continue
+            from_success = (
+                execution_results.get("GENERATE_DESCRIPTION") == "success"
+                if field == "description"
+                else execution_results.get("GENERATE_CTA") == "success"
+            )
+            if from_success and stable:
+                reusable_generated[field] = value
+
+        required_fields = (
+            "name", "business_type", "brand_style", "email", "phone",
+            "instagram", "description", "cta_primary", "cta_secondary",
+        )
+        merged = {k: str(raw_input.get(k, "") or "").strip() for k in required_fields}
+        field_sources = {k: "raw" for k in required_fields}
+
+        for field in required_fields:
+            truth_value = str(truth_data.get(field, "") or "").strip()
+            if truth_value:
+                merged[field] = truth_value
+                field_sources[field] = "truth"
+                continue
+            memory_value = str(reusable_generated.get(field, "") or "").strip()
+            if memory_value and not merged[field]:
+                merged[field] = memory_value
+                field_sources[field] = "memory"
+
+        profile_defaults = profile_data.get("defaults", {}) if isinstance(profile_data.get("defaults", {}), dict) else {}
+        for field in ("business_type", "brand_style", "cta_primary", "cta_secondary"):
+            if merged[field]:
+                continue
+            profile_value = str(profile_defaults.get(field) or profile_data.get(field) or "").strip()
+            if profile_value:
+                merged[field] = profile_value
+                field_sources[field] = "profile"
+
+        source_signature_payload = {
+            "slug": slug,
+            "truth": truth_data,
+            "profile": profile_data,
+            "reusable_generated": reusable_generated,
+            "raw_input": raw_input,
+            "stable": stable,
+            "frozen": frozen,
+        }
+        source_signature = hashlib.sha256(
+            json.dumps(source_signature_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        self._log_activity(
+            f"[CONTEXT] build slug={slug} sources={','.join(included_sources)} "
+            f"stable={stable} frozen={frozen}"
+        )
+        self._log_activity(
+            f"[CONTEXT] fields slug={slug} "
+            f"{','.join(f'{k}:{v}' for k, v in sorted(field_sources.items()))}"
+        )
+
+        return {
+            "slug": slug,
+            "identity": identity,
+            "truth_data": truth_data,
+            "profile": profile_data,
+            "memory": memory,
+            "last_successful_generated_fields": reusable_generated,
+            "last_evaluation_summary": {
+                "last_evaluation": evaluation,
+                "scores": memory.get("scores", {}),
+                "issues": memory.get("issues", []),
+            },
+            "stable": stable,
+            "frozen": frozen,
+            "source_signature": source_signature,
+            "included_sources": included_sources,
+            "field_sources": field_sources,
+            "analysis_input": merged,
+        }
+
     def _load_client_memory(self, slug: str) -> dict:
         """Load structured memory for a client; return empty shape if unavailable."""
         memory_file = self.paths["clients"] / slug / "memory.json"
@@ -743,7 +899,9 @@ class AgentApp:
             "scores": {},
             "issues": [],
             "stable": False,
+            "freeze": False,
             "source_signature": "",
+            "last_context_summary": {},
             "timestamp": "",
         }
         if not memory_file.exists():
@@ -760,7 +918,9 @@ class AgentApp:
                 "scores": data.get("scores", {}),
                 "issues": data.get("issues", []),
                 "stable": bool(data.get("stable", False)),
+                "freeze": bool(data.get("freeze", False)),
                 "source_signature": data.get("source_signature", ""),
+                "last_context_summary": data.get("last_context_summary", {}),
                 "timestamp": data.get("timestamp", ""),
             }
         except Exception as exc:
@@ -772,19 +932,44 @@ class AgentApp:
         client_root = self.paths["clients"] / slug
         client_root.mkdir(parents=True, exist_ok=True)
         memory_file = client_root / "memory.json"
+        existing = self._load_client_memory(slug) if memory_file.exists() else {}
         payload = {
-            "last_action_plan": data.get("last_action_plan", []),
-            "execution_results": data.get("execution_results", {}),
-            "generated_fields": data.get("generated_fields", {}),
-            "last_evaluation": data.get("last_evaluation", {}),
-            "scores": data.get("scores", {}),
-            "issues": data.get("issues", []),
-            "stable": bool(data.get("stable", False)),
-            "source_signature": data.get("source_signature", ""),
+            "last_action_plan": data.get("last_action_plan", existing.get("last_action_plan", [])),
+            "execution_results": data.get("execution_results", existing.get("execution_results", {})),
+            "generated_fields": data.get("generated_fields", existing.get("generated_fields", {})),
+            "last_evaluation": data.get("last_evaluation", existing.get("last_evaluation", {})),
+            "scores": data.get("scores", existing.get("scores", {})),
+            "issues": data.get("issues", existing.get("issues", [])),
+            "stable": bool(data.get("stable", existing.get("stable", False))),
+            "freeze": bool(data.get("freeze", existing.get("freeze", False))),
+            "source_signature": data.get("source_signature", existing.get("source_signature", "")),
+            "last_context_summary": data.get("last_context_summary", existing.get("last_context_summary", {})),
             "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
         }
         memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._log_activity(f"[MEMORY] updated slug={slug} path={memory_file}")
+
+    def _persist_context_summary(self, slug: str, context: dict) -> None:
+        memory = self._load_client_memory(slug)
+        profile = context.get("profile", {}) if isinstance(context.get("profile", {}), dict) else {}
+        defaults = profile.get("defaults", {}) if isinstance(profile.get("defaults", {}), dict) else {}
+        active_profile_values = {}
+        for field in ("business_type", "brand_style", "cta_primary", "cta_secondary"):
+            value = defaults.get(field, profile.get(field, ""))
+            if str(value).strip():
+                active_profile_values[field] = value
+
+        memory["last_context_summary"] = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "active_profile_values": active_profile_values,
+            "reused_generated_fields": context.get("last_successful_generated_fields", {}),
+            "evaluation_snapshot": context.get("last_evaluation_summary", {}),
+            "source_signature": context.get("source_signature", ""),
+        }
+        memory["freeze"] = bool(context.get("frozen", False))
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
+        self._log_activity(f"[CONTEXT] persisted summary slug={slug}")
 
     def _source_signature(self, raw_data: dict) -> str:
         normalized = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
@@ -963,13 +1148,15 @@ class AgentApp:
         try:
             raw_data = json.loads(notes_file.read_text(encoding="utf-8"))
             raw_data["overwrite"] = True
-            analysis = self._analyze_client(raw_data)
-            execution = self._execute_action_plan(analysis)
+            context = self._build_client_context(slug, raw_data)
+            analysis = self._analyze_client(context["analysis_input"], context=context)
+            execution = self._execute_action_plan(analysis, context=context)
             final_analysis: ClientAnalysis = execution["analysis"]
             client_data: dict = execution["client_data"]
             execution_results: dict = execution.get("execution_results", {})
             self._log_analysis(final_analysis, f"supervisor:{slug}")
             notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._persist_context_summary(final_analysis.slug, context)
 
             memory = self._load_client_memory(final_analysis.slug)
             memory["last_action_plan"] = final_analysis.action_plan
@@ -985,7 +1172,7 @@ class AgentApp:
         except Exception as exc:
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=failed error={exc}")
 
-    def _execute_action_plan(self, client_analysis: ClientAnalysis) -> dict:
+    def _execute_action_plan(self, client_analysis: ClientAnalysis, context: dict | None = None) -> dict:
         """
         Execute analysis.action_plan in strict deterministic order (no parallelism).
 
@@ -1009,8 +1196,22 @@ class AgentApp:
         client_data = client_analysis.to_dict()
         final_slug = client_analysis.slug
         copied = 0
-        previous_memory = self._load_client_memory(final_slug)
-        previous_generated = previous_memory.get("generated_fields", {})
+        context = context or {}
+        can_reuse_context_memory = (
+            context.get("slug") == client_analysis.slug and "RESOLVE_SLUG" not in planned
+        )
+        if can_reuse_context_memory:
+            previous_memory = (
+                context.get("memory", {})
+                if isinstance(context.get("memory", {}), dict)
+                else self._load_client_memory(final_slug)
+            )
+            previous_generated = context.get("last_successful_generated_fields", {})
+            if not isinstance(previous_generated, dict):
+                previous_generated = {}
+        else:
+            previous_memory = {}
+            previous_generated = {}
         previous_results = previous_memory.get("execution_results", {})
         execution_results: dict[str, str] = {}
 
@@ -1116,19 +1317,36 @@ class AgentApp:
             return
         try:
             raw_data = self._read_client_data(client_root)
-            inferred_slug = self.sanitize_client_name(str(raw_data.get("name", "")))
-            existing_memory = self._load_client_memory(inferred_slug)
-            generated_fields = existing_memory.get("generated_fields", {})
-            for field in ("description", "cta_primary", "cta_secondary"):
-                if not str(raw_data.get(field, "")).strip() and str(generated_fields.get(field, "")).strip():
-                    raw_data[field] = generated_fields[field]
-                    self._log_activity(f"[MEMORY] preloaded raw field={field} slug={inferred_slug}")
+            slug = self.selected_client or self.sanitize_client_name(str(raw_data.get("name", "")))
+            context = self._build_client_context(slug, raw_data)
+            analysis = self._analyze_client(context["analysis_input"], context=context)
+            execution = self._execute_action_plan(analysis, context=context)
+            final_analysis: ClientAnalysis = execution["analysis"]
+            client_data: dict = execution["client_data"]
+            copied: int = execution["copied"]
+            execution_results: dict = execution.get("execution_results", {})
+            self._log_analysis(final_analysis, self.selected_client or "manual")
 
-            analysis = self._analyze_client(raw_data)
-            self._log_analysis(analysis, self.selected_client or "manual")
-            copied = self._run_site_generation(client_root, analysis.to_dict())
-            self.status_var.set(f"Generated site for {self.selected_client} ({copied} files).")
-            messagebox.showinfo("Generate Site", f"Generated {copied} files for {self.selected_client}.")
+            notes_file = execution["client_root"] / "notes" / "client.json"
+            notes_file.parent.mkdir(parents=True, exist_ok=True)
+            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._persist_context_summary(final_analysis.slug, context)
+            self._update_client_memory(
+                final_analysis.slug,
+                {
+                    "last_action_plan": final_analysis.action_plan,
+                    "execution_results": execution_results,
+                    "generated_fields": {
+                        "description": client_data.get("description", ""),
+                        "cta_primary": client_data.get("cta_primary", ""),
+                        "cta_secondary": client_data.get("cta_secondary", ""),
+                    },
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+
+            self.status_var.set(f"Generated site for {final_analysis.slug} ({copied} files).")
+            messagebox.showinfo("Generate Site", f"Generated {copied} files for {final_analysis.slug}.")
         except Exception as exc:
             self._show_error(f"Site generation failed: {exc}")
 
@@ -1336,18 +1554,13 @@ class AgentApp:
                 raw_data = json.load(f)
 
             inferred_slug = self.sanitize_client_name(str(raw_data.get("name", "")))
-            existing_memory = self._load_client_memory(inferred_slug)
-            generated_fields = existing_memory.get("generated_fields", {})
-            for field in ("description", "cta_primary", "cta_secondary"):
-                if not str(raw_data.get(field, "")).strip() and str(generated_fields.get(field, "")).strip():
-                    raw_data[field] = generated_fields[field]
-                    self._log_activity(f"[MEMORY] preloaded raw field={field} slug={inferred_slug}")
+            context = self._build_client_context(inferred_slug, raw_data)
 
             # 2. Decision layer: validate, enrich, normalize
-            analysis = self._analyze_client(raw_data)
+            analysis = self._analyze_client(context["analysis_input"], context=context)
 
             # 3. Execute action plan deterministically (may resolve slug and build site)
-            execution = self._execute_action_plan(analysis)
+            execution = self._execute_action_plan(analysis, context=context)
             final_analysis: ClientAnalysis = execution["analysis"]
             client_data: dict = execution["client_data"]
             client_root: Path = execution["client_root"]
@@ -1361,6 +1574,7 @@ class AgentApp:
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
             notes_file = client_root / "notes" / "client.json"
             notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._persist_context_summary(final_analysis.slug, context)
 
             self._update_client_memory(
                 final_analysis.slug,
