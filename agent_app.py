@@ -32,7 +32,7 @@ PLACEHOLDERS = {
     "{{CTA_SECONDARY}}": "cta_secondary",
 }
 
-REQUIRED_ROOT_FOLDERS = ("clients", "templates", "prompts", "assets", "deploy", "tools", "logs")
+REQUIRED_ROOT_FOLDERS = ("clients", "templates", "prompts", "assets", "deploy", "tools", "logs", "notes")
 REQUIRED_TEMPLATE_PLACEHOLDERS = (
     "{{BUSINESS_NAME}}",
     "{{BUSINESS_TYPE}}",
@@ -47,6 +47,15 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
 INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
 EVALUATION_THRESHOLD = 0.85
 REASONING_CONFIDENCE_THRESHOLD = 0.7
+SYSTEM_LEARNING_INTERVAL_CYCLES = 10
+
+ADJUSTMENT_BOUNDS = {
+    "evaluation_threshold": {"min": 0.70, "max": 0.95},
+    "reasoning_confidence_threshold": {"min": 0.50, "max": 0.90},
+    "priority_weight": {"min": 0.20, "max": 0.60},
+    "source_changed_penalty": {"min": 0.0, "max": 0.08},
+    "confidence_adjustment": {"min": -0.10, "max": 0.10},
+}
 
 SUPPORTED_REASONING_TASK_TYPES = {
     "improve_description",
@@ -155,6 +164,7 @@ class AgentApp:
             "deploy":    self.base_dir / "deploy",
             "tools":     self.base_dir / "tools",
             "logs":      self.base_dir / "logs",
+            "notes":     self.base_dir / "notes",
             "config":    self.base_dir / "config.json",
         }
 
@@ -174,8 +184,28 @@ class AgentApp:
         self._auto_lock  = threading.Lock()
         self._stats      = {"found": 0, "processed": 0, "errors": 0}
         self._known_clients: list[str] = []
+        self._supervisor_cycle_count = 0
+        self._learning_controls = {
+            "evaluation_threshold": EVALUATION_THRESHOLD,
+            "reasoning_confidence_threshold": REASONING_CONFIDENCE_THRESHOLD,
+            "weights": {
+                "completeness": 0.4,
+                "description": 0.3,
+                "cta": 0.3,
+            },
+            "scoring_modifiers": {
+                "source_changed_penalty": 0.01,
+            },
+            "reasoning_confidence_adjustment": 0.0,
+        }
+        self._system_learning_state = {
+            "last_analysis": {},
+            "applied_adjustments": [],
+            "system_score_trend": [],
+        }
 
         self._ensure_core_structure()
+        self._load_system_learning_state()
         self._build_ui()
         self.refresh_client_list()
 
@@ -221,6 +251,61 @@ class AgentApp:
                 json.dumps(default_config, indent=2),
                 encoding="utf-8",
             )
+
+    def _system_learning_file(self) -> Path:
+        return self.paths["notes"] / "system_learning.json"
+
+    def _load_system_learning_state(self) -> None:
+        state_file = self._system_learning_file()
+        if not state_file.exists():
+            self._persist_system_learning_state()
+            return
+        try:
+            payload = json.loads(state_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
+            self._system_learning_state["last_analysis"] = payload.get("last_analysis", {})
+            self._system_learning_state["applied_adjustments"] = payload.get("applied_adjustments", [])
+            self._system_learning_state["system_score_trend"] = payload.get("system_score_trend", [])
+            controls = payload.get("active_controls", {})
+            if isinstance(controls, dict):
+                self._learning_controls["evaluation_threshold"] = float(
+                    controls.get("evaluation_threshold", self._learning_controls["evaluation_threshold"])
+                )
+                self._learning_controls["reasoning_confidence_threshold"] = float(
+                    controls.get(
+                        "reasoning_confidence_threshold",
+                        self._learning_controls["reasoning_confidence_threshold"],
+                    )
+                )
+                if isinstance(controls.get("weights", {}), dict):
+                    self._learning_controls["weights"].update(controls.get("weights", {}))
+                if isinstance(controls.get("scoring_modifiers", {}), dict):
+                    self._learning_controls["scoring_modifiers"].update(controls.get("scoring_modifiers", {}))
+                self._learning_controls["reasoning_confidence_adjustment"] = float(
+                    controls.get(
+                        "reasoning_confidence_adjustment",
+                        self._learning_controls["reasoning_confidence_adjustment"],
+                    )
+                )
+        except Exception as exc:
+            self._log_activity(f"[SYSTEM_LEARNING] failed_to_load_state error={exc}")
+
+    def _persist_system_learning_state(self) -> None:
+        payload = {
+            "last_analysis": self._system_learning_state.get("last_analysis", {}),
+            "applied_adjustments": self._system_learning_state.get("applied_adjustments", []),
+            "system_score_trend": self._system_learning_state.get("system_score_trend", [])[-50:],
+            "active_controls": self._learning_controls,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._system_learning_file().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _effective_reasoning_threshold(self) -> float:
+        base_threshold = float(self._learning_controls.get("reasoning_confidence_threshold", REASONING_CONFIDENCE_THRESHOLD))
+        adjustment = float(self._learning_controls.get("reasoning_confidence_adjustment", 0.0))
+        bounded = base_threshold + adjustment
+        return max(ADJUSTMENT_BOUNDS["reasoning_confidence_threshold"]["min"], min(ADJUSTMENT_BOUNDS["reasoning_confidence_threshold"]["max"], bounded))
 
     # ------------------------------------------------------------------ #
     #  UI construction
@@ -1051,12 +1136,31 @@ class AgentApp:
         proposed_fields: list[str],
         accepted: bool,
         fallback_reason: str = "",
+        slug: str | None = None,
     ) -> None:
         status = "accepted" if accepted else "rejected"
         self._log_activity(
             f"[REASONING] task_type={task_type} confidence_score={confidence_score:.2f} "
             f"fields={','.join(proposed_fields)} status={status} fallback_reason={fallback_reason or 'none'}"
         )
+        if not slug:
+            return
+        memory = self._load_client_memory(slug)
+        history = memory.get("reasoning_history", {})
+        if not isinstance(history, dict):
+            history = {}
+        history["total_calls"] = int(history.get("total_calls", 0)) + 1
+        history["accepted_calls"] = int(history.get("accepted_calls", 0)) + (1 if accepted else 0)
+        history["rejected_outputs"] = int(history.get("rejected_outputs", 0)) + (0 if accepted else 1)
+        if fallback_reason and fallback_reason != "none":
+            history["fallback_count"] = int(history.get("fallback_count", 0)) + 1
+            last_reasons = history.get("last_fallback_reasons", [])
+            if not isinstance(last_reasons, list):
+                last_reasons = []
+            history["last_fallback_reasons"] = (last_reasons + [fallback_reason])[-10:]
+        memory["reasoning_history"] = history
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
 
     def _load_client_memory(self, slug: str) -> dict:
         """Load structured memory for a client; return empty shape if unavailable."""
@@ -1066,12 +1170,14 @@ class AgentApp:
             "execution_results": {},
             "generated_fields": {},
             "last_evaluation": {},
+            "evaluation_history": [],
             "scores": {},
             "issues": [],
             "stable": False,
             "freeze": False,
             "source_signature": "",
             "last_context_summary": {},
+            "reasoning_history": {},
             "timestamp": "",
         }
         if not memory_file.exists():
@@ -1085,12 +1191,14 @@ class AgentApp:
                 "execution_results": data.get("execution_results", {}),
                 "generated_fields": data.get("generated_fields", {}),
                 "last_evaluation": data.get("last_evaluation", {}),
+                "evaluation_history": data.get("evaluation_history", []),
                 "scores": data.get("scores", {}),
                 "issues": data.get("issues", []),
                 "stable": bool(data.get("stable", False)),
                 "freeze": bool(data.get("freeze", False)),
                 "source_signature": data.get("source_signature", ""),
                 "last_context_summary": data.get("last_context_summary", {}),
+                "reasoning_history": data.get("reasoning_history", {}),
                 "timestamp": data.get("timestamp", ""),
             }
         except Exception as exc:
@@ -1108,12 +1216,14 @@ class AgentApp:
             "execution_results": data.get("execution_results", existing.get("execution_results", {})),
             "generated_fields": data.get("generated_fields", existing.get("generated_fields", {})),
             "last_evaluation": data.get("last_evaluation", existing.get("last_evaluation", {})),
+            "evaluation_history": data.get("evaluation_history", existing.get("evaluation_history", [])),
             "scores": data.get("scores", existing.get("scores", {})),
             "issues": data.get("issues", existing.get("issues", [])),
             "stable": bool(data.get("stable", existing.get("stable", False))),
             "freeze": bool(data.get("freeze", existing.get("freeze", False))),
             "source_signature": data.get("source_signature", existing.get("source_signature", "")),
             "last_context_summary": data.get("last_context_summary", existing.get("last_context_summary", {})),
+            "reasoning_history": data.get("reasoning_history", existing.get("reasoning_history", {})),
             "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
         }
         memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1238,7 +1348,8 @@ class AgentApp:
             reasoning = self._run_local_reasoning(context, "semantic_quality_check")
             proposals = reasoning.get("proposed_fields", {})
             semantic_flags = proposals.get("semantic_flags", []) if isinstance(proposals, dict) else []
-            if isinstance(semantic_flags, list) and reasoning.get("confidence_score", 0.0) >= REASONING_CONFIDENCE_THRESHOLD:
+            reasoning_threshold = self._effective_reasoning_threshold()
+            if isinstance(semantic_flags, list) and reasoning.get("confidence_score", 0.0) >= reasoning_threshold:
                 semantic_signal = {
                     "used": True,
                     "confidence_score": float(reasoning.get("confidence_score", 0.0)),
@@ -1252,6 +1363,7 @@ class AgentApp:
                     float(reasoning.get("confidence_score", 0.0)),
                     sorted(proposals.keys()) if isinstance(proposals, dict) else [],
                     accepted=True,
+                    slug=slug,
                 )
             else:
                 self._log_reasoning_call(
@@ -1260,6 +1372,7 @@ class AgentApp:
                     sorted(proposals.keys()) if isinstance(proposals, dict) else [],
                     accepted=False,
                     fallback_reason="low_confidence_or_empty_signal",
+                    slug=slug,
                 )
         except Exception as exc:
             self._log_reasoning_call(
@@ -1268,20 +1381,35 @@ class AgentApp:
                 [],
                 accepted=False,
                 fallback_reason=f"fallback_due_to_error:{exc}",
+                slug=slug,
             )
 
+        weights = self._learning_controls.get("weights", {})
+        completeness_weight = float(weights.get("completeness", 0.4))
+        description_weight = float(weights.get("description", 0.3))
+        cta_weight = float(weights.get("cta", 0.3))
+        weight_total = completeness_weight + description_weight + cta_weight
+        if weight_total <= 0:
+            completeness_weight, description_weight, cta_weight = 0.4, 0.3, 0.3
+            weight_total = 1.0
         overall_score = round(
-            (completeness_score * 0.4) + (description_score * 0.3) + (cta_score * 0.3),
+            (
+                (completeness_score * completeness_weight)
+                + (description_score * description_weight)
+                + (cta_score * cta_weight)
+            ) / weight_total,
             2,
         )
 
         source_signature = self._source_signature(raw) if raw else ""
         source_changed = bool(source_signature) and source_signature != memory.get("source_signature", "")
-        if source_changed and overall_score >= EVALUATION_THRESHOLD:
-            overall_score = round(EVALUATION_THRESHOLD - 0.01, 2)
+        evaluation_threshold = float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD))
+        source_changed_penalty = float(self._learning_controls.get("scoring_modifiers", {}).get("source_changed_penalty", 0.01))
+        if source_changed and overall_score >= evaluation_threshold:
+            overall_score = round(evaluation_threshold - source_changed_penalty, 2)
             unique_issues = sorted(set(unique_issues + ["source_input_changed"]))
             unique_actions = sorted(set(unique_actions + ["refresh_site_from_updated_input"]))
-        stable = bool(overall_score >= EVALUATION_THRESHOLD and not source_changed)
+        stable = bool(overall_score >= evaluation_threshold and not source_changed)
 
         return {
             "slug": slug,
@@ -1314,7 +1442,7 @@ class AgentApp:
         elif completeness_score < 1.0:
             bucket = "missing_required_fields"
             priority_value = 1
-        elif overall_score < EVALUATION_THRESHOLD:
+        elif overall_score < float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)):
             bucket = "low_quality_outputs"
             priority_value = 2
         elif source_changed or not evaluation.get("stable", False):
@@ -1334,7 +1462,7 @@ class AgentApp:
         memory = self._load_client_memory(slug)
         memory["last_evaluation"] = {
             "evaluated_at": datetime.now().isoformat(timespec="seconds"),
-            "threshold": EVALUATION_THRESHOLD,
+            "threshold": float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)),
         }
         memory["scores"] = {
             "completeness_score": evaluation["completeness_score"],
@@ -1342,6 +1470,19 @@ class AgentApp:
             "cta_score": evaluation["cta_score"],
             "overall_score": evaluation["overall_score"],
         }
+        history = memory.get("evaluation_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "overall_score": evaluation["overall_score"],
+                "completeness_score": evaluation["completeness_score"],
+                "description_score": evaluation["description_score"],
+                "cta_score": evaluation["cta_score"],
+            }
+        )
+        memory["evaluation_history"] = history[-40:]
         memory["issues"] = evaluation["issues_detected"]
         memory["stable"] = bool(evaluation.get("stable", False))
         memory["source_signature"] = evaluation.get("source_signature", "")
@@ -1472,7 +1613,7 @@ class AgentApp:
                                 )
                                 if not valid_json:
                                     fallback_reason = "invalid_structured_json"
-                                elif confidence < REASONING_CONFIDENCE_THRESHOLD:
+                                elif confidence < self._effective_reasoning_threshold():
                                     fallback_reason = "low_confidence"
                                 elif conflict_with_truth:
                                     fallback_reason = "conflicts_with_truth"
@@ -1488,6 +1629,7 @@ class AgentApp:
                                     sorted(proposals.keys()) if isinstance(proposals, dict) else [],
                                     accepted=bool(proposed_description),
                                     fallback_reason=fallback_reason,
+                                    slug=final_slug,
                                 )
                             except Exception as exc:
                                 fallback_reason = f"fallback_due_to_error:{exc}"
@@ -1497,6 +1639,7 @@ class AgentApp:
                                     [],
                                     accepted=False,
                                     fallback_reason=fallback_reason,
+                                    slug=final_slug,
                                 )
                             if not proposed_description:
                                 client_data["description"] = deterministic_description
@@ -1530,7 +1673,7 @@ class AgentApp:
                             )
                             if not valid_json:
                                 fallback_reason = "invalid_structured_json"
-                            elif reasoning_cta_confidence < REASONING_CONFIDENCE_THRESHOLD:
+                            elif reasoning_cta_confidence < self._effective_reasoning_threshold():
                                 fallback_reason = "low_confidence"
                             elif conflict_with_truth:
                                 fallback_reason = "conflicts_with_truth"
@@ -1577,6 +1720,7 @@ class AgentApp:
                         reasoning_cta_fields,
                         accepted=reasoning_cta_accepted,
                         fallback_reason=fallback_reason or ("none" if reasoning_cta_accepted else "deterministic_fallback"),
+                        slug=final_slug,
                     )
 
                 elif step == "RESOLVE_SLUG":
@@ -1735,8 +1879,11 @@ class AgentApp:
             self._stop_event.wait(timeout=INBOX_SCAN_INTERVAL)
 
     def _run_supervisor_cycle(self) -> None:
+        self._supervisor_cycle_count += 1
         self._scan_existing_clients()
         self._evaluate_and_prioritize_clients()
+        if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
+            self._run_system_learning_cycle()
         if self._auto_mode:
             self._scan_and_process_inbox()
 
@@ -1759,7 +1906,7 @@ class AgentApp:
 
         ranked.sort(key=lambda item: item[0])
         for _, slug, evaluation, priority in ranked:
-            if evaluation["overall_score"] >= EVALUATION_THRESHOLD and not evaluation.get("source_changed", False):
+            if evaluation["overall_score"] >= float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)) and not evaluation.get("source_changed", False):
                 self._log_activity(
                     f"[SUPERVISOR] skipped slug={slug} reason=stable_above_threshold "
                     f"score={evaluation['overall_score']:.2f}"
@@ -1783,6 +1930,226 @@ class AgentApp:
         except PermissionError as exc:
             self._log_activity(f"[ERROR] Cannot read clients directory: {exc}")
             return []
+
+    def _analyze_system_performance(self) -> dict:
+        memory_files = sorted(self.paths["clients"].glob("*/memory.json"))
+        failure_counter: dict[str, int] = {}
+        issue_counter: dict[str, int] = {}
+        weak_field_counter = {"description": 0, "cta": 0, "completeness": 0}
+        rejected_reasoning_outputs = 0
+        total_reasoning_calls = 0
+        total_fallback_count = 0
+        evaluation_scores: list[float] = []
+        failed_clients = 0
+
+        for memory_file in memory_files:
+            try:
+                memory = json.loads(memory_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(memory, dict):
+                continue
+
+            execution_results = memory.get("execution_results", {})
+            if isinstance(execution_results, dict):
+                has_failure = False
+                for step, status in execution_results.items():
+                    if status == "failed":
+                        failure_counter[step] = failure_counter.get(step, 0) + 1
+                        has_failure = True
+                if has_failure:
+                    failed_clients += 1
+
+            scores = memory.get("scores", {})
+            if isinstance(scores, dict):
+                overall_score = float(scores.get("overall_score", 0.0))
+                if overall_score:
+                    evaluation_scores.append(overall_score)
+                if float(scores.get("description_score", 0.0)) < 0.8:
+                    weak_field_counter["description"] += 1
+                if float(scores.get("cta_score", 0.0)) < 0.8:
+                    weak_field_counter["cta"] += 1
+                if float(scores.get("completeness_score", 0.0)) < 1.0:
+                    weak_field_counter["completeness"] += 1
+
+            for issue in memory.get("issues", []):
+                issue_name = str(issue)
+                issue_counter[issue_name] = issue_counter.get(issue_name, 0) + 1
+
+            reasoning_history = memory.get("reasoning_history", {})
+            if isinstance(reasoning_history, dict):
+                rejected_reasoning_outputs += int(reasoning_history.get("rejected_outputs", 0))
+                total_reasoning_calls += int(reasoning_history.get("total_calls", 0))
+                total_fallback_count += int(reasoning_history.get("fallback_count", 0))
+
+        mean_score = round(sum(evaluation_scores) / len(evaluation_scores), 3) if evaluation_scores else 0.0
+        failure_rate = round(failed_clients / len(memory_files), 3) if memory_files else 0.0
+        fallback_frequency = round(total_fallback_count / total_reasoning_calls, 3) if total_reasoning_calls else 0.0
+        reasoning_effectiveness = round(
+            max(0.0, min(1.0, 1.0 - fallback_frequency - (failure_rate * 0.2))),
+            3,
+        )
+
+        recurring_failures = sorted(
+            [name for name, count in failure_counter.items() if count >= 2]
+        )
+        weak_fields = sorted([name for name, count in weak_field_counter.items() if count > 0])
+        system_issues = sorted([name for name, count in issue_counter.items() if count >= 2])[:20]
+
+        improvement_opportunities = []
+        if recurring_failures:
+            improvement_opportunities.append("reduce_failed_steps_with_targeted_threshold_tuning")
+        if fallback_frequency > 0.45:
+            improvement_opportunities.append("decrease_reasoning_acceptance_barrier_carefully")
+        if mean_score < 0.85:
+            improvement_opportunities.append("increase_quality_weighting_for_weak_fields")
+        if rejected_reasoning_outputs > 0:
+            improvement_opportunities.append("tighten_reasoning_validation_rules")
+
+        return {
+            "system_issues": system_issues,
+            "recurring_failures": recurring_failures,
+            "weak_fields": weak_fields,
+            "reasoning_effectiveness_score": reasoning_effectiveness,
+            "improvement_opportunities": improvement_opportunities,
+            "metrics": {
+                "memory_files_scanned": len(memory_files),
+                "mean_overall_score": mean_score,
+                "rejected_reasoning_outputs": rejected_reasoning_outputs,
+                "fallback_frequency": fallback_frequency,
+                "failure_rate": failure_rate,
+            },
+        }
+
+    def _generate_system_adjustments(self, analysis: dict) -> dict:
+        metrics = analysis.get("metrics", {}) if isinstance(analysis.get("metrics", {}), dict) else {}
+        fallback_frequency = float(metrics.get("fallback_frequency", 0.0))
+        mean_score = float(metrics.get("mean_overall_score", 0.0))
+        recurring_failures = analysis.get("recurring_failures", []) if isinstance(analysis.get("recurring_failures", []), list) else []
+
+        recommended_threshold_changes = {}
+        if fallback_frequency > 0.50:
+            recommended_threshold_changes["reasoning_confidence_threshold"] = -0.03
+        elif fallback_frequency < 0.10:
+            recommended_threshold_changes["reasoning_confidence_threshold"] = 0.01
+
+        if mean_score < 0.80:
+            recommended_threshold_changes["evaluation_threshold"] = -0.02
+        elif mean_score > 0.92:
+            recommended_threshold_changes["evaluation_threshold"] = 0.01
+
+        priority_weight_adjustments = {}
+        weak_fields = analysis.get("weak_fields", []) if isinstance(analysis.get("weak_fields", []), list) else []
+        if "description" in weak_fields:
+            priority_weight_adjustments["description"] = 0.02
+        if "cta" in weak_fields:
+            priority_weight_adjustments["cta"] = 0.02
+        if "completeness" in weak_fields:
+            priority_weight_adjustments["completeness"] = 0.02
+
+        return {
+            "recommended_threshold_changes": recommended_threshold_changes,
+            "profile_adjustments": {
+                "focus_profile_refresh": bool(recurring_failures),
+            },
+            "validation_rule_tweaks": {
+                "stricter_reasoning_validation": bool(analysis.get("system_issues", [])),
+            },
+            "reasoning_confidence_adjustments": {
+                "offset": -0.01 if fallback_frequency > 0.55 else 0.0,
+            },
+            "priority_weight_adjustments": priority_weight_adjustments,
+        }
+
+    def _apply_safe_adjustments(self, adjustments: dict) -> dict:
+        applied_changes: list[dict] = []
+        before_controls = json.loads(json.dumps(self._learning_controls))
+        forbidden_targets = ("system_logic", "truth_data", "raw_client_data", "execution_order")
+        blocked_attempts = [target for target in forbidden_targets if target in adjustments]
+        if blocked_attempts:
+            self._log_activity(f"[SYSTEM_LEARNING] blocked_forbidden_adjustments={','.join(blocked_attempts)}")
+
+        threshold_changes = adjustments.get("recommended_threshold_changes", {})
+        if isinstance(threshold_changes, dict):
+            for key in ("evaluation_threshold", "reasoning_confidence_threshold"):
+                if key not in threshold_changes:
+                    continue
+                delta = float(threshold_changes.get(key, 0.0))
+                bounds = ADJUSTMENT_BOUNDS[key]
+                before = float(self._learning_controls.get(key, 0.0))
+                after = max(bounds["min"], min(bounds["max"], before + delta))
+                self._learning_controls[key] = round(after, 3)
+                applied_changes.append({"type": "threshold", "key": key, "before": before, "after": after})
+
+        weight_changes = adjustments.get("priority_weight_adjustments", {})
+        if isinstance(weight_changes, dict):
+            weights = self._learning_controls.get("weights", {})
+            for key in ("completeness", "description", "cta"):
+                if key not in weight_changes:
+                    continue
+                delta = float(weight_changes.get(key, 0.0))
+                before = float(weights.get(key, 0.0))
+                after = max(
+                    ADJUSTMENT_BOUNDS["priority_weight"]["min"],
+                    min(ADJUSTMENT_BOUNDS["priority_weight"]["max"], before + delta),
+                )
+                weights[key] = round(after, 3)
+                applied_changes.append({"type": "weight", "key": key, "before": before, "after": after})
+            self._learning_controls["weights"] = weights
+
+        confidence_adjustment = adjustments.get("reasoning_confidence_adjustments", {})
+        if isinstance(confidence_adjustment, dict):
+            delta = float(confidence_adjustment.get("offset", 0.0))
+            before = float(self._learning_controls.get("reasoning_confidence_adjustment", 0.0))
+            after = max(
+                ADJUSTMENT_BOUNDS["confidence_adjustment"]["min"],
+                min(ADJUSTMENT_BOUNDS["confidence_adjustment"]["max"], before + delta),
+            )
+            self._learning_controls["reasoning_confidence_adjustment"] = round(after, 3)
+            if delta:
+                applied_changes.append(
+                    {"type": "scoring_modifier", "key": "reasoning_confidence_adjustment", "before": before, "after": after}
+                )
+
+        self._log_activity(f"[SYSTEM_LEARNING] proposed_adjustments={json.dumps(adjustments, sort_keys=True)}")
+        self._log_activity(f"[SYSTEM_LEARNING] applied_changes={json.dumps(applied_changes, sort_keys=True)}")
+
+        return {
+            "before_controls": before_controls,
+            "after_controls": json.loads(json.dumps(self._learning_controls)),
+            "applied_changes": applied_changes,
+            "reversible_snapshot": before_controls,
+        }
+
+    def _run_system_learning_cycle(self) -> None:
+        before_metrics = {"evaluation_threshold": self._learning_controls["evaluation_threshold"]}
+        analysis = self._analyze_system_performance()
+        adjustments = self._generate_system_adjustments(analysis)
+        applied = self._apply_safe_adjustments(adjustments)
+        after_metrics = {"evaluation_threshold": self._learning_controls["evaluation_threshold"]}
+
+        self._system_learning_state["last_analysis"] = analysis
+        self._system_learning_state["applied_adjustments"] = (
+            self._system_learning_state.get("applied_adjustments", []) + [applied]
+        )[-40:]
+        trend = self._system_learning_state.get("system_score_trend", [])
+        if not isinstance(trend, list):
+            trend = []
+        trend.append(
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "reasoning_effectiveness_score": analysis.get("reasoning_effectiveness_score", 0.0),
+                "mean_overall_score": analysis.get("metrics", {}).get("mean_overall_score", 0.0),
+            }
+        )
+        self._system_learning_state["system_score_trend"] = trend[-80:]
+        self._persist_system_learning_state()
+
+        self._log_activity(
+            f"[SYSTEM_LEARNING] detected_issues={','.join(analysis.get('system_issues', [])) or 'none'} "
+            f"before_metrics={json.dumps(before_metrics, sort_keys=True)} "
+            f"after_metrics={json.dumps(after_metrics, sort_keys=True)}"
+        )
 
     def _scan_existing_clients(self) -> None:
         clients = self._discover_clients()
