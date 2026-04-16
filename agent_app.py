@@ -1321,7 +1321,7 @@ class AgentApp:
             allowed_actions = merged.get("allowed_actions", [])
             if not isinstance(allowed_actions, list):
                 allowed_actions = DEFAULT_ACTION_POLICY["allowed_actions"]
-            merged["allowed_actions"] = [str(item) for item in allowed_actions]
+            merged["allowed_actions"] = [str(item).strip() for item in allowed_actions if str(item).strip()]
             allowed_domains = merged.get("allowed_domains", [])
             if not isinstance(allowed_domains, list):
                 allowed_domains = []
