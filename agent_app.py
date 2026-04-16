@@ -916,9 +916,6 @@ class AgentApp:
         if task_type not in SUPPORTED_REASONING_TASK_TYPES:
             raise ValueError(f"Unsupported task_type: {task_type}")
 
-        truth_data = client_context.get("truth_data", {}) if isinstance(client_context.get("truth_data", {}), dict) else {}
-        profile = client_context.get("profile", {}) if isinstance(client_context.get("profile", {}), dict) else {}
-        memory = client_context.get("memory", {}) if isinstance(client_context.get("memory", {}), dict) else {}
         evaluation_snapshot = client_context.get("last_evaluation_summary", {})
         if not isinstance(evaluation_snapshot, dict):
             evaluation_snapshot = {}
