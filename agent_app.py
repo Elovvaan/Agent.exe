@@ -5165,7 +5165,7 @@ class AgentApp:
         """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
-        self._event_handler_pool.shutdown(wait=True, cancel_futures=False)
+        self._event_handler_pool.shutdown(wait=False, cancel_futures=True)
         self._graceful_shutdown_runtime()
         self._join_background_threads(timeout=2.0)
         self.root.destroy()
