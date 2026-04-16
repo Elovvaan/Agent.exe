@@ -73,6 +73,9 @@ MAX_CYCLE_EVENT_BUDGET = 200
 MIN_RETRY_EVENT_BUDGET = 5
 RETRY_EVENT_BUDGET_MULTIPLIER = 2
 MAX_RETRY_EVENT_BUDGET = 50
+EVENT_ROUTER_MAX_WAIT_SECONDS = 2.0
+EVENT_ROUTER_MAX_RETRIES = 2
+MAX_EVENT_HANDLER_FAILURES = 3
 
 EXECUTION_MODE_CONFIG = {
     "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
@@ -136,6 +139,11 @@ SUPPORTED_EVENT_TYPES = {
     EVENT_VERIFICATION_FAILED,
     EVENT_GOAL_PROGRESS_UPDATED,
     EVENT_EXPLORATION_NEEDED,
+    EVENT_OPTIMIZER_ESCALATION,
+}
+HIGH_PRIORITY_EVENT_TYPES = {
+    EVENT_TASK_FAILED,
+    EVENT_VERIFICATION_FAILED,
     EVENT_OPTIMIZER_ESCALATION,
 }
 DEFAULT_ACTION_POLICY = {
@@ -319,6 +327,9 @@ class AgentApp:
         self._task_round_robin_cursor = 0
         self._runtime_bus_lock = threading.Lock()
         self._runtime_bus = self._initialize_runtime_bus()
+        self._event_router_lock = threading.Lock()
+        self._event_trace_seq = 0
+        self._event_handler_pool = ThreadPoolExecutor(max_workers=max(2, int(self._system_runtime_state.get("max_concurrent_tasks", 5))))
 
         self._ensure_core_structure()
         self._load_system_learning_state()
@@ -390,6 +401,13 @@ class AgentApp:
                 "task_dispatch_latency": 0.0,
                 "task_execution_latency": 0.0,
                 "verification_latency": 0.0,
+                "event_route_latency": 0.0,
+                "handler_execution_time": 0.0,
+                "immediate_event_routes": 0,
+                "queued_event_routes": 0,
+                "immediate_route_ratio": 0.0,
+                "routing_collisions": 0,
+                "routing_retries": 0,
                 "session_cache_hits": 0,
                 "session_cache_misses": 0,
                 "session_efficiency_gain": 0.0,
@@ -602,18 +620,199 @@ class AgentApp:
         self._persist_system_runtime(payload)
         self._persist_system_learning_state()
 
-    def _emit_event(self, event_type: str, payload: dict) -> None:
+    def _next_event_trace_id(self) -> int:
+        with self._event_router_lock:
+            self._event_trace_seq += 1
+            return self._event_trace_seq
+
+    def _queue_event(self, event: dict, runtime: dict | None = None) -> None:
+        with self._runtime_bus_lock:
+            queue = self._runtime_bus.setdefault("pending_events", [])
+            queue.append(event)
+            depth = len(queue)
+            telemetry = self._runtime_bus.setdefault("telemetry", {})
+            queued_count = int(telemetry.get("queued_event_routes", 0)) + 1
+            immediate_count = int(telemetry.get("immediate_event_routes", 0))
+            total_routes = immediate_count + queued_count
+            telemetry["queued_event_routes"] = queued_count
+            telemetry["event_queue_depth"] = depth
+            telemetry["immediate_route_ratio"] = round(immediate_count / total_routes, 3) if total_routes > 0 else 0.0
+        if isinstance(runtime, dict):
+            self._record_runtime_telemetry(
+                runtime,
+                {
+                    "queued_event_routes": queued_count,
+                    "event_queue_depth": depth,
+                    "immediate_route_ratio": telemetry.get("immediate_route_ratio", 0.0),
+                },
+            )
+
+    def _route_event(self, event: dict, cycle_state: dict | None = None) -> bool:
+        if not isinstance(event, dict):
+            return False
+        event_type = str(event.get("event_type", ""))
+        started = time.perf_counter()
+        runtime = cycle_state.get("runtime", {}) if isinstance(cycle_state, dict) else None
+        route_mode = "queued"
+        try:
+            if not isinstance(cycle_state, dict) or cycle_state.get("fallback_phase18", False):
+                self._queue_event(event, runtime)
+                return False
+            immediate = event_type in HIGH_PRIORITY_EVENT_TYPES
+            route_mode = "immediate" if immediate else "async"
+            if immediate:
+                self._execute_routed_event(event, cycle_state)
+                return True
+            if not self._event_handler_pool:
+                self._queue_event(event, runtime)
+                return False
+            future = self._event_handler_pool.submit(self._execute_routed_event, event, cycle_state)
+            futures = cycle_state.setdefault("routing_futures", [])
+            if isinstance(futures, list):
+                futures.append(future)
+            return True
+        except Exception as exc:
+            self._log_activity(f"[EVENT] route_failed event={event_type} error={type(exc).__name__}:{exc}")
+            if isinstance(cycle_state, dict):
+                cycle_state["fallback_phase18"] = True
+            self._queue_event(event, runtime)
+            return False
+        finally:
+            elapsed = round(max(0.0, time.perf_counter() - started), 4)
+            with self._runtime_bus_lock:
+                telemetry = self._runtime_bus.setdefault("telemetry", {})
+                telemetry["event_route_latency"] = elapsed
+                if route_mode in {"immediate", "async"}:
+                    telemetry["immediate_event_routes"] = int(telemetry.get("immediate_event_routes", 0)) + 1
+                immediate_count = int(telemetry.get("immediate_event_routes", 0))
+                queued_count = int(telemetry.get("queued_event_routes", 0))
+                total_routes = immediate_count + queued_count
+                telemetry["immediate_route_ratio"] = round(immediate_count / total_routes, 3) if total_routes > 0 else 0.0
+                queue_depth = int(telemetry.get("event_queue_depth", 0))
+            self._log_activity(
+                f"[EVENT] route trace={event.get('event_trace_id', 0)} type={event_type} mode={route_mode} "
+                f"latency={elapsed:.4f}s queue_depth={queue_depth}"
+            )
+            if isinstance(runtime, dict):
+                self._record_runtime_telemetry(
+                    runtime,
+                    {
+                        "event_route_latency": elapsed,
+                        "immediate_event_routes": int(self._runtime_bus.get("telemetry", {}).get("immediate_event_routes", 0)),
+                        "queued_event_routes": int(self._runtime_bus.get("telemetry", {}).get("queued_event_routes", 0)),
+                        "immediate_route_ratio": self._runtime_bus.get("telemetry", {}).get("immediate_route_ratio", 0.0),
+                    },
+                )
+
+    def _execute_routed_event(self, event: dict, cycle_state: dict) -> None:
+        event_type = str(event.get("event_type", ""))
+        retries = max(0, int(event.get("routing_retries", 0)))
+        lock = cycle_state.get("event_lock")
+        if not (hasattr(lock, "acquire") and hasattr(lock, "release")):
+            lock = None
+        if lock and not lock.acquire(blocking=False):
+            with self._runtime_bus_lock:
+                telemetry = self._runtime_bus.setdefault("telemetry", {})
+                telemetry["routing_collisions"] = int(telemetry.get("routing_collisions", 0)) + 1
+            if retries < EVENT_ROUTER_MAX_RETRIES:
+                event["routing_retries"] = retries + 1
+                with self._runtime_bus_lock:
+                    telemetry = self._runtime_bus.setdefault("telemetry", {})
+                    telemetry["routing_retries"] = int(telemetry.get("routing_retries", 0)) + 1
+                self._queue_event(event, cycle_state.get("runtime", {}))
+            elif event_type != EVENT_OPTIMIZER_ESCALATION:
+                self._emit_event(
+                    EVENT_OPTIMIZER_ESCALATION,
+                    {"task": event.get("payload", {}).get("task", {}), "reason": f"route_collision:{event_type}"},
+                    cycle_state=cycle_state,
+                )
+            return
+        started = time.perf_counter()
+        try:
+            self._handle_event(event, cycle_state)
+        except Exception as exc:
+            self._log_activity(f"[EVENT] handler_failed event={event_type} error={exc}")
+            failures = int(cycle_state.get("event_failures", 0)) + 1
+            cycle_state["event_failures"] = failures
+            if retries < EVENT_ROUTER_MAX_RETRIES:
+                event["routing_retries"] = retries + 1
+                with self._runtime_bus_lock:
+                    telemetry = self._runtime_bus.setdefault("telemetry", {})
+                    telemetry["routing_retries"] = int(telemetry.get("routing_retries", 0)) + 1
+                self._queue_event(event, cycle_state.get("runtime", {}))
+            elif event_type != EVENT_OPTIMIZER_ESCALATION and failures <= MAX_EVENT_HANDLER_FAILURES:
+                self._emit_event(
+                    EVENT_OPTIMIZER_ESCALATION,
+                    {"task": event.get("payload", {}).get("task", {}), "reason": f"event_handler_failure:{type(exc).__name__}"},
+                    cycle_state=cycle_state,
+                )
+            if failures > MAX_EVENT_HANDLER_FAILURES:
+                cycle_state["fallback_phase18"] = True
+                self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
+        finally:
+            elapsed = round(max(0.0, time.perf_counter() - started), 4)
+            self._record_runtime_telemetry(cycle_state.get("runtime", {}), {"handler_execution_time": elapsed})
+            if lock:
+                lock.release()
+
+    def _await_routed_events(self, cycle_state: dict, timeout_seconds: float = EVENT_ROUTER_MAX_WAIT_SECONDS) -> None:
+        futures = cycle_state.get("routing_futures", [])
+        if not isinstance(futures, list) or not futures:
+            return
+        deadline = time.perf_counter() + max(0.0, timeout_seconds)
+        incomplete_futures: list = []
+        for future in futures:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if remaining <= 0:
+                if not future.done():
+                    incomplete_futures.append(future)
+                continue
+            try:
+                future.result(timeout=remaining)
+            except Exception as exc:
+                self._log_activity(f"[EVENT] async_wait_failed error={type(exc).__name__}:{exc}")
+        cycle_state["routing_futures"] = incomplete_futures
+
+    def _emit_event(self, event_type: str, payload: dict, cycle_state: dict | None = None) -> None:
         if event_type not in SUPPORTED_EVENT_TYPES:
             return
         event = {
             "event_type": event_type,
             "payload": payload if isinstance(payload, dict) else {},
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event_trace_id": self._next_event_trace_id(),
+            "routing_retries": 0,
         }
-        with self._runtime_bus_lock:
-            queue = self._runtime_bus.setdefault("pending_events", [])
-            queue.append(event)
-            self._runtime_bus["telemetry"]["event_queue_depth"] = len(queue)
+        routed = self._route_event(event, cycle_state=cycle_state)
+        if not routed:
+            self._log_activity(
+                f"[EVENT] queued trace={event['event_trace_id']} type={event_type} reason=router_fallback"
+            )
+
+    def _execute_task_and_emit_completion(self, task: dict, cycle_state: dict) -> None:
+        runtime = cycle_state.get("runtime", {})
+        task_result = self._execute_goal_task_worker(task, runtime)
+        task_results = [task_result] if task_result else []
+        if task_results:
+            self._persist_runtime_checkpoint("after_task_completion_batch", runtime)
+        for result in task_results:
+            task_payload = result.get("task", {})
+            completion = {
+                "status": result.get("status", "failed"),
+                "run_result": result.get("run_result", "failed"),
+                "runtime_session_id": result.get("runtime_session_id", ""),
+                "compute_units_used": result.get("compute_units", {}),
+                "verifiable_result": {
+                    "type": ACTION_COMMAND,
+                    "exit_code": 0 if result.get("status") == "success" else 1,
+                    "output_valid": result.get("status") == "success",
+                },
+            }
+            self._emit_event(
+                EVENT_TASK_COMPLETED if result.get("status") == "success" else EVENT_TASK_FAILED,
+                {"task": task_payload, "completion": completion},
+                cycle_state=cycle_state,
+            )
 
     def _register_runtime_task(self, task: dict, runtime_session_id: str) -> None:
         record = {
@@ -720,7 +919,7 @@ class AgentApp:
         if event_type == EVENT_TASK_READY:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
             if task:
-                self._emit_event(EVENT_TASK_ASSIGNED, {"task": task})
+                self._emit_event(EVENT_TASK_ASSIGNED, {"task": task}, cycle_state=cycle_state)
             return
         if event_type == EVENT_TASK_ASSIGNED:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
@@ -742,19 +941,19 @@ class AgentApp:
                 return
             assigned = self._assign_agent(task, runtime)
             if not assigned:
-                self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"task": task, "reason": "agent_pool_saturated"})
+                self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"task": task, "reason": "agent_pool_saturated"}, cycle_state=cycle_state)
                 return
             task["assigned_agent"] = assigned
             task["status"] = TASK_STATUS_RUNNING
             task["started_at"] = datetime.now().isoformat(timespec="seconds")
             self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
             if self._log_task_start(task, runtime):
-                self._emit_event(EVENT_TASK_STARTED, {"task": task})
+                self._emit_event(EVENT_TASK_STARTED, {"task": task}, cycle_state=cycle_state)
             return
         if event_type == EVENT_TASK_STARTED:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
             if task:
-                cycle_state.setdefault("dispatch_tasks", []).append(task)
+                self._execute_task_and_emit_completion(task, cycle_state)
             return
         if event_type == EVENT_TASK_COMPLETED or event_type == EVENT_TASK_FAILED:
             started_verification = time.perf_counter()
@@ -768,7 +967,11 @@ class AgentApp:
             verification_passed = bool(completion.get("verification", {}).get("passed", False))
             task["verification_status"] = "passed" if verification_passed else "failed"
             self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
-            self._emit_event(EVENT_VERIFICATION_PASSED if verification_passed else EVENT_VERIFICATION_FAILED, {"task": task, "completion": completion})
+            self._emit_event(
+                EVENT_VERIFICATION_PASSED if verification_passed else EVENT_VERIFICATION_FAILED,
+                {"task": task, "completion": completion},
+                cycle_state=cycle_state,
+            )
             goal_id = str(task.get("goal_id", ""))
             goal = cycle_state["goals_by_id"].get(goal_id, {})
             slug = str(task.get("client_slug", "")).strip()
@@ -778,7 +981,11 @@ class AgentApp:
                 cached_context, _ = self._get_client_context_from_session(slug)
                 cached_context["evaluation"] = post_eval
                 progress = self._evaluate_goal_progress(goal, cached_context)
-                self._emit_event(EVENT_GOAL_PROGRESS_UPDATED, {"task": task, "progress": progress, "run_result": completion.get("run_result", "failed")})
+                self._emit_event(
+                    EVENT_GOAL_PROGRESS_UPDATED,
+                    {"task": task, "progress": progress, "run_result": completion.get("run_result", "failed")},
+                    cycle_state=cycle_state,
+                )
             self._record_runtime_telemetry(runtime, {"verification_latency": round(max(0.0, time.perf_counter() - started_verification), 3)})
             return
         if event_type == EVENT_VERIFICATION_FAILED:
@@ -832,7 +1039,7 @@ class AgentApp:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
             if task:
                 task["exploration_task"] = True
-                self._emit_event(EVENT_TASK_READY, {"task": task})
+                self._emit_event(EVENT_TASK_READY, {"task": task}, cycle_state=cycle_state)
             return
         if event_type == EVENT_OPTIMIZER_ESCALATION:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
@@ -850,26 +1057,6 @@ class AgentApp:
                     event = queue.pop(0)
                     self._runtime_bus["telemetry"]["event_queue_depth"] = len(queue)
             if event is None:
-                pending_dispatch = cycle_state.get("dispatch_tasks", [])
-                if pending_dispatch:
-                    task_results = self._execute_task_batch_parallel(pending_dispatch[:], cycle_state["runtime"])
-                    cycle_state["dispatch_tasks"] = []
-                    self._persist_runtime_checkpoint("after_task_completion_batch", cycle_state["runtime"])
-                    for result in task_results:
-                        task = result.get("task", {})
-                        completion = {
-                            "status": result.get("status", "failed"),
-                            "run_result": result.get("run_result", "failed"),
-                            "runtime_session_id": result.get("runtime_session_id", ""),
-                            "compute_units_used": result.get("compute_units", {}),
-                            "verifiable_result": {
-                                "type": ACTION_COMMAND,
-                                "exit_code": 0 if result.get("status") == "success" else 1,
-                                "output_valid": result.get("status") == "success",
-                            },
-                        }
-                        self._emit_event(EVENT_TASK_COMPLETED if result.get("status") == "success" else EVENT_TASK_FAILED, {"task": task, "completion": completion})
-                    continue
                 break
             try:
                 self._handle_event(event, cycle_state)
@@ -877,9 +1064,9 @@ class AgentApp:
                 self._log_activity(f"[EVENT] handler_failed event={event.get('event_type', '')} error={exc}")
                 failures = int(cycle_state.get("event_failures", 0)) + 1
                 cycle_state["event_failures"] = failures
-                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= 3:
-                    self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"})
-                if failures > 3:
+                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= MAX_EVENT_HANDLER_FAILURES:
+                    self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"}, cycle_state=cycle_state)
+                if failures > MAX_EVENT_HANDLER_FAILURES:
                     self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
                     break
             processed += 1
@@ -4220,24 +4407,34 @@ class AgentApp:
         cycle_state = {
             "runtime": runtime,
             "goals_by_id": goals_by_id,
-            "dispatch_tasks": [],
+            "event_lock": threading.RLock(),
+            "routing_futures": [],
+            "fallback_phase18": False,
             "goal_completion_recorded": False,
             "progress_advanced": False,
             "verification_failures": 0,
+            "event_failures": 0,
         }
         for task in runnable:
             self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
-            self._emit_event(EVENT_TASK_READY, {"task": task})
+            self._emit_event(EVENT_TASK_READY, {"task": task}, cycle_state=cycle_state)
         if not runnable and queued and runtime.get("forced_progress_active", False):
-            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
+            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]}, cycle_state=cycle_state)
+        self._await_routed_events(cycle_state)
         cycle_budget = max(MIN_CYCLE_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * CYCLE_EVENT_BUDGET_MULTIPLIER)
         cycle_budget = min(MAX_CYCLE_EVENT_BUDGET, cycle_budget)
         self._drain_event_queue(cycle_state, cycle_budget)
+        self._await_routed_events(cycle_state)
         if not cycle_state["progress_advanced"] and queued:
-            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
+            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]}, cycle_state=cycle_state)
+            self._await_routed_events(cycle_state)
             retry_budget = max(MIN_RETRY_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * RETRY_EVENT_BUDGET_MULTIPLIER)
             retry_budget = min(MAX_RETRY_EVENT_BUDGET, retry_budget)
             self._drain_event_queue(cycle_state, retry_budget)
+            self._await_routed_events(cycle_state)
+        if cycle_state.get("fallback_phase18", False):
+            self._log_activity("[EVENT] router_fallback phase=18 reason=route_or_handler_failure")
+            self._drain_event_queue(cycle_state, MAX_CYCLE_EVENT_BUDGET)
         if cycle_state["goal_completion_recorded"] or cycle_state["progress_advanced"]:
             runtime["cycles_since_progress"] = 0
         else:
@@ -4968,6 +5165,7 @@ class AgentApp:
         """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
+        self._event_handler_pool.shutdown(wait=False, cancel_futures=True)
         self._graceful_shutdown_runtime()
         self._join_background_threads(timeout=2.0)
         self.root.destroy()

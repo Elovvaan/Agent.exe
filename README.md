@@ -144,3 +144,17 @@ Then open **Artifacts** → `Agent-windows-bundle`.
   - verification failures
   - goal completion
   - shutdown
+
+## 11) Phase 19: Decentralized event routing
+- Added decentralized `_route_event(event)` dispatch path with:
+  - direct routing by event type
+  - immediate execution for high-priority failures/escalations
+  - queued fallback when routing is unsafe or fails
+- Task flow is now self-propagating (`task_started` runs execution and emits `task_completed/task_failed`, which then emits verification/progress events).
+- Supervisor now coordinates goals/tasks and enforces safeguards while event handlers execute through the router.
+- Router telemetry includes:
+  - `event_route_latency`
+  - `handler_execution_time`
+  - immediate vs queued route ratio
+  - routing collisions and retries
+- Deterministic fallback remains in place: queued drain loop still processes events when router fallback is activated.
