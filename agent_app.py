@@ -43,7 +43,7 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
     "{{CTA_SECONDARY}}",
 )
 
-INBOX_SCAN_INTERVAL = 4  # seconds between inbox scans
+INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
 
 JOB_PENDING    = "pending"
 JOB_PROCESSING = "processing"
@@ -163,6 +163,7 @@ class AgentApp:
         self._stop_event = threading.Event()
         self._auto_lock  = threading.Lock()
         self._stats      = {"found": 0, "processed": 0, "errors": 0}
+        self._known_clients: list[str] = []
 
         self._ensure_core_structure()
         self._build_ui()
@@ -171,7 +172,7 @@ class AgentApp:
         # Clean shutdown when the window is closed
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Background loop starts immediately; only processes jobs when auto mode is ON
+        # Background supervisor loop starts immediately
         self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
         self._auto_thread.start()
 
@@ -305,13 +306,19 @@ class AgentApp:
 
     def refresh_client_list(self) -> None:
         self.client_list.delete(0, END)
-        self.paths["clients"].mkdir(parents=True, exist_ok=True)
-        client_names = sorted(
-            p.name for p in self.paths["clients"].iterdir()
-            if p.is_dir() and p.name != "inbox"
-        )
-        for name in client_names:
+        client_names = self._discover_clients()
+        selected_index = None
+        for idx, name in enumerate(client_names):
             self.client_list.insert(END, name)
+            if name == self.selected_client:
+                selected_index = idx
+        self._known_clients = client_names
+
+        if selected_index is not None:
+            self.client_list.selection_set(selected_index)
+            self.client_list.activate(selected_index)
+        elif self.selected_client is not None:
+            self.selected_client = None
 
     def choose_root(self):
         new_root = filedialog.askdirectory(
@@ -969,17 +976,40 @@ class AgentApp:
             self._log_activity("Auto mode disabled.")
 
     def _auto_loop(self) -> None:
-        """Background thread: wakes every INBOX_SCAN_INTERVAL seconds."""
+        """Background thread: continuously supervises inbox and client state."""
         while not self._stop_event.is_set():
-            if self._auto_mode:
-                try:
-                    self._scan_and_process_inbox()
-                except Exception as exc:
-                    self._log_activity(
-                        f"[ERROR] Unhandled exception in auto loop: {exc}\n"
-                        f"{traceback.format_exc()}"
-                    )
+            try:
+                self._run_supervisor_cycle()
+            except Exception as exc:
+                self._log_activity(
+                    f"[ERROR] Unhandled exception in supervisor loop: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
             self._stop_event.wait(timeout=INBOX_SCAN_INTERVAL)
+
+    def _run_supervisor_cycle(self) -> None:
+        self._scan_existing_clients()
+        if self._auto_mode:
+            self._scan_and_process_inbox()
+
+    def _discover_clients(self) -> list[str]:
+        self.paths["clients"].mkdir(parents=True, exist_ok=True)
+        try:
+            return sorted(
+                p.name for p in self.paths["clients"].iterdir()
+                if p.is_dir() and p.name != "inbox"
+            )
+        except PermissionError as exc:
+            self._log_activity(f"[ERROR] Cannot read clients directory: {exc}")
+            return []
+
+    def _scan_existing_clients(self) -> None:
+        clients = self._discover_clients()
+        if clients == self._known_clients:
+            return
+        self._known_clients = clients
+        self._log_activity(f"Client scan: {len(clients)} client(s) detected.")
+        self._schedule_ui_update(self.refresh_client_list)
 
     def _scan_and_process_inbox(self) -> None:
         inbox = self.paths["inbox"]
