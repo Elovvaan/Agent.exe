@@ -297,18 +297,7 @@ class AgentApp:
     def _load_active_goals(self) -> list[dict]:
         goals_file = self._system_goals_file()
         if not goals_file.exists():
-            default_goals = {
-                "active_goals": [
-                    {
-                        "goal_id": "client_growth_001",
-                        "client_slug": "example_client",
-                        "objective": "Fully optimize client profile to high-quality score",
-                        "target_state": {"overall_score": 0.9},
-                        "status": GOAL_STATUS_ACTIVE,
-                        "priority": "high",
-                    }
-                ]
-            }
+            default_goals = {"active_goals": []}
             self._persist_system_goals(default_goals)
             return default_goals["active_goals"]
         try:
