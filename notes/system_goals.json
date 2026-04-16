@@ -1,0 +1,14 @@
+{
+  "active_goals": [
+    {
+      "goal_id": "client_growth_001",
+      "client_slug": "example_client",
+      "objective": "Fully optimize client profile to high-quality score",
+      "target_state": {
+        "overall_score": 0.9
+      },
+      "status": "active",
+      "priority": "high"
+    }
+  ]
+}
