@@ -2224,9 +2224,13 @@ class AgentApp:
             return {"status": "skipped", "details": "no_op"}
 
         if action_type == ACTION_FILE_WRITE:
-            output_root = self.paths["clients"] / slug / "safe_outputs"
+            output_root = (self.paths["clients"] / slug / "safe_outputs").resolve()
             output_root.mkdir(parents=True, exist_ok=True)
             target_path = (self.base_dir / Path(target)).resolve()
+            try:
+                target_path.relative_to(output_root)
+            except Exception:
+                return {"status": "failed", "details": "file_write_outside_safe_outputs"}
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             return {"status": "success", "details": f"wrote:{target_path}"}
