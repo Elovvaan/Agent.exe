@@ -2775,11 +2775,12 @@ class AgentApp:
         if queued_index < 0:
             return selected, queued
         fallback_task = queued.pop(queued_index)
-        selected.append(fallback_task)
-        selected = sorted(
-            selected,
-            key=lambda item: self._safe_float(item.get("priority_score", 0.0), 0.0),
-        )[1:]
+        lowest_index = min(
+            range(len(selected)),
+            key=lambda idx: self._safe_float(selected[idx].get("priority_score", 0.0), 0.0),
+        )
+        queued.append(selected[lowest_index])
+        selected[lowest_index] = fallback_task
         return selected, queued
 
     def _assign_agent(self, task: dict, runtime: dict) -> str:
