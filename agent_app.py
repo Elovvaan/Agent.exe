@@ -456,7 +456,6 @@ class AgentApp:
         client_slug = self.sanitize_client_name(data.name)
         client_root = self.paths["clients"] / client_slug
         notes_file  = client_root / "notes" / "client.json"
-        profile_file = client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME
         try:
             if client_root.exists() or notes_file.exists():
                 overwrite = messagebox.askyesno(
@@ -473,11 +472,7 @@ class AgentApp:
 
             with notes_file.open("w", encoding="utf-8") as f:
                 json.dump(data.to_dict(), f, indent=2)
-            if not profile_file.exists():
-                profile_file.write_text(
-                    json.dumps(DEFAULT_INTELLIGENCE_PROFILE, indent=2),
-                    encoding="utf-8",
-                )
+            self._ensure_client_intelligence_profile(client_root)
 
             self.refresh_client_list()
             self.selected_client = client_slug
@@ -543,12 +538,20 @@ class AgentApp:
                 profile[key] = value.strip()
         return profile
 
+    def _ensure_client_intelligence_profile(self, client_root: Path) -> None:
+        profile_file = client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME
+        if profile_file.exists():
+            return
+        profile_file.write_text(
+            json.dumps(DEFAULT_INTELLIGENCE_PROFILE, indent=2),
+            encoding="utf-8",
+        )
+
     def _profile_description_for_name(self, profile: dict, name: str) -> str:
         template = str(
-            profile.get("description_template", DEFAULT_INTELLIGENCE_PROFILE["description_template"])
+            profile.get("description_template")
+            or DEFAULT_INTELLIGENCE_PROFILE["description_template"]
         ).strip()
-        if not template:
-            template = DEFAULT_INTELLIGENCE_PROFILE["description_template"]
         try:
             description = template.format(name=name)
         except Exception:
