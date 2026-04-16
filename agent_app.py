@@ -1197,9 +1197,20 @@ class AgentApp:
         final_slug = client_analysis.slug
         copied = 0
         context = context or {}
-        previous_memory = context.get("memory", {}) if isinstance(context.get("memory", {}), dict) else self._load_client_memory(final_slug)
-        previous_generated = context.get("last_successful_generated_fields", {})
-        if not isinstance(previous_generated, dict):
+        can_reuse_context_memory = (
+            context.get("slug") == client_analysis.slug and "RESOLVE_SLUG" not in planned
+        )
+        if can_reuse_context_memory:
+            previous_memory = (
+                context.get("memory", {})
+                if isinstance(context.get("memory", {}), dict)
+                else self._load_client_memory(final_slug)
+            )
+            previous_generated = context.get("last_successful_generated_fields", {})
+            if not isinstance(previous_generated, dict):
+                previous_generated = {}
+        else:
+            previous_memory = {}
             previous_generated = {}
         previous_results = previous_memory.get("execution_results", {})
         execution_results: dict[str, str] = {}
