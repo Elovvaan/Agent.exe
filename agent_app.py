@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -44,6 +45,7 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
 )
 
 INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
+EVALUATION_THRESHOLD = 0.85
 
 JOB_PENDING    = "pending"
 JOB_PROCESSING = "processing"
@@ -737,6 +739,11 @@ class AgentApp:
             "last_action_plan": [],
             "execution_results": {},
             "generated_fields": {},
+            "last_evaluation": {},
+            "scores": {},
+            "issues": [],
+            "stable": False,
+            "source_signature": "",
             "timestamp": "",
         }
         if not memory_file.exists():
@@ -749,6 +756,11 @@ class AgentApp:
                 "last_action_plan": data.get("last_action_plan", []),
                 "execution_results": data.get("execution_results", {}),
                 "generated_fields": data.get("generated_fields", {}),
+                "last_evaluation": data.get("last_evaluation", {}),
+                "scores": data.get("scores", {}),
+                "issues": data.get("issues", []),
+                "stable": bool(data.get("stable", False)),
+                "source_signature": data.get("source_signature", ""),
                 "timestamp": data.get("timestamp", ""),
             }
         except Exception as exc:
@@ -764,10 +776,214 @@ class AgentApp:
             "last_action_plan": data.get("last_action_plan", []),
             "execution_results": data.get("execution_results", {}),
             "generated_fields": data.get("generated_fields", {}),
+            "last_evaluation": data.get("last_evaluation", {}),
+            "scores": data.get("scores", {}),
+            "issues": data.get("issues", []),
+            "stable": bool(data.get("stable", False)),
+            "source_signature": data.get("source_signature", ""),
             "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
         }
         memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._log_activity(f"[MEMORY] updated slug={slug} path={memory_file}")
+
+    def _source_signature(self, raw_data: dict) -> str:
+        normalized = json.dumps(raw_data, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _evaluate_client_state(self, slug: str) -> dict:
+        client_root = self.paths["clients"] / slug
+        notes_file = client_root / "notes" / "client.json"
+        memory = self._load_client_memory(slug)
+        issues_detected: list[str] = []
+        recommended_actions: list[str] = []
+
+        raw: dict = {}
+        if not notes_file.exists():
+            issues_detected.append("missing_client_notes")
+            recommended_actions.append("restore_client_notes")
+        else:
+            try:
+                raw = json.loads(notes_file.read_text(encoding="utf-8"))
+            except Exception:
+                issues_detected.append("invalid_client_notes")
+                recommended_actions.append("repair_client_notes_json")
+
+        required_fields = (
+            "name", "business_type", "brand_style", "email", "phone",
+            "instagram", "description", "cta_primary", "cta_secondary",
+        )
+        present_required = 0
+        placeholder_pattern = re.compile(r"{{[^{}]+}}")
+        execution_results = memory.get("execution_results", {})
+
+        for field in required_fields:
+            value = str(raw.get(field, "")).strip()
+            if value:
+                present_required += 1
+            else:
+                issues_detected.append(f"missing_{field}")
+
+            if placeholder_pattern.search(value):
+                issues_detected.append(f"placeholder_in_{field}")
+
+            if re.search(r"\b(traceback|exception|error|failed)\b", value, re.IGNORECASE):
+                issues_detected.append(f"failed_residue_in_{field}")
+
+        completeness_score = round(present_required / len(required_fields), 2)
+
+        description = str(raw.get("description", "")).strip()
+        description_score = 1.0
+        if not description:
+            description_score -= 0.6
+            recommended_actions.append("regenerate_description")
+        if description and (len(description) < 40 or len(description) > 500):
+            description_score -= 0.25
+            issues_detected.append("description_length_out_of_bounds")
+            recommended_actions.append("normalize_description_length")
+        name_tokens = [t for t in re.split(r"[^a-z0-9]+", str(raw.get("name", "")).lower()) if len(t) >= 3]
+        business_tokens = [t for t in re.split(r"[^a-z0-9]+", str(raw.get("business_type", "")).lower()) if len(t) >= 4]
+        keyword_tokens = set(name_tokens[:3] + business_tokens[:3])
+        if description and keyword_tokens:
+            lowered_description = description.lower()
+            if not any(token in lowered_description for token in keyword_tokens):
+                description_score -= 0.15
+                issues_detected.append("description_missing_keywords")
+                recommended_actions.append("inject_business_keywords_in_description")
+        if placeholder_pattern.search(description):
+            description_score -= 0.25
+        description_score = round(max(0.0, min(1.0, description_score)), 2)
+
+        cta_primary = str(raw.get("cta_primary", "")).strip()
+        cta_secondary = str(raw.get("cta_secondary", "")).strip()
+        cta_score = 1.0
+        action_words = ("book", "call", "contact", "start", "learn", "shop", "schedule", "get")
+        if not cta_primary or not cta_secondary:
+            cta_score -= 0.6
+            issues_detected.append("empty_cta")
+            recommended_actions.append("regenerate_cta")
+        for cta_field, value in (("cta_primary", cta_primary), ("cta_secondary", cta_secondary)):
+            if value and (len(value) < 4 or len(value) > 80):
+                cta_score -= 0.2
+                issues_detected.append(f"{cta_field}_length_out_of_bounds")
+            if value and not any(word in value.lower() for word in action_words):
+                cta_score -= 0.1
+                issues_detected.append(f"{cta_field}_missing_action_keyword")
+        cta_score = round(max(0.0, min(1.0, cta_score)), 2)
+
+        if any(status == "failed" for status in execution_results.values()):
+            issues_detected.append("failed_execution_residue")
+            recommended_actions.append("rerun_failed_actions")
+
+        unique_issues = sorted(set(issues_detected))
+        unique_actions = sorted(set(recommended_actions))
+
+        overall_score = round(
+            (completeness_score * 0.4) + (description_score * 0.3) + (cta_score * 0.3),
+            2,
+        )
+
+        source_signature = self._source_signature(raw) if raw else ""
+        source_changed = bool(source_signature) and source_signature != memory.get("source_signature", "")
+        if source_changed and overall_score >= EVALUATION_THRESHOLD:
+            overall_score = round(EVALUATION_THRESHOLD - 0.01, 2)
+            unique_issues = sorted(set(unique_issues + ["source_input_changed"]))
+            unique_actions = sorted(set(unique_actions + ["refresh_site_from_updated_input"]))
+        stable = bool(overall_score >= EVALUATION_THRESHOLD and not source_changed)
+
+        return {
+            "slug": slug,
+            "completeness_score": completeness_score,
+            "description_score": description_score,
+            "cta_score": cta_score,
+            "overall_score": overall_score,
+            "issues_detected": unique_issues,
+            "recommended_actions": unique_actions,
+            "source_signature": source_signature,
+            "source_changed": source_changed,
+            "stable": stable,
+        }
+
+    def _priority_rank(self, evaluation: dict) -> dict:
+        issues = set(evaluation.get("issues_detected", []))
+        overall_score = float(evaluation.get("overall_score", 0.0))
+        completeness_score = float(evaluation.get("completeness_score", 0.0))
+        source_changed = bool(evaluation.get("source_changed", False))
+
+        if (
+            "failed_execution_residue" in issues
+            or "missing_client_notes" in issues
+            or "invalid_client_notes" in issues
+            or any(issue.startswith("failed_residue_in_") for issue in issues)
+        ):
+            bucket = "broken_failed_clients"
+            priority_value = 0
+        elif completeness_score < 1.0:
+            bucket = "missing_required_fields"
+            priority_value = 1
+        elif overall_score < EVALUATION_THRESHOLD:
+            bucket = "low_quality_outputs"
+            priority_value = 2
+        elif source_changed or not evaluation.get("stable", False):
+            bucket = "stale_incomplete_clients"
+            priority_value = 3
+        else:
+            bucket = "healthy_clients_skipped"
+            priority_value = 4
+
+        return {
+            "bucket": bucket,
+            "priority_value": priority_value,
+            "sort_key": (priority_value, overall_score),
+        }
+
+    def _persist_client_evaluation(self, slug: str, evaluation: dict) -> None:
+        memory = self._load_client_memory(slug)
+        memory["last_evaluation"] = {
+            "evaluated_at": datetime.now().isoformat(timespec="seconds"),
+            "threshold": EVALUATION_THRESHOLD,
+        }
+        memory["scores"] = {
+            "completeness_score": evaluation["completeness_score"],
+            "description_score": evaluation["description_score"],
+            "cta_score": evaluation["cta_score"],
+            "overall_score": evaluation["overall_score"],
+        }
+        memory["issues"] = evaluation["issues_detected"]
+        memory["stable"] = bool(evaluation.get("stable", False))
+        memory["source_signature"] = evaluation.get("source_signature", "")
+        memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        self._update_client_memory(slug, memory)
+
+    def _schedule_client_supervisor_work(self, slug: str, reason: str) -> None:
+        client_root = self.paths["clients"] / slug
+        notes_file = client_root / "notes" / "client.json"
+        if not notes_file.exists():
+            self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} skipped=missing_notes")
+            return
+        try:
+            raw_data = json.loads(notes_file.read_text(encoding="utf-8"))
+            raw_data["overwrite"] = True
+            analysis = self._analyze_client(raw_data)
+            execution = self._execute_action_plan(analysis)
+            final_analysis: ClientAnalysis = execution["analysis"]
+            client_data: dict = execution["client_data"]
+            execution_results: dict = execution.get("execution_results", {})
+            self._log_analysis(final_analysis, f"supervisor:{slug}")
+            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+
+            memory = self._load_client_memory(final_analysis.slug)
+            memory["last_action_plan"] = final_analysis.action_plan
+            memory["execution_results"] = execution_results
+            memory["generated_fields"] = {
+                "description": client_data.get("description", ""),
+                "cta_primary": client_data.get("cta_primary", ""),
+                "cta_secondary": client_data.get("cta_secondary", ""),
+            }
+            memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
+            self._update_client_memory(final_analysis.slug, memory)
+            self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=processed")
+        except Exception as exc:
+            self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=failed error={exc}")
 
     def _execute_action_plan(self, client_analysis: ClientAnalysis) -> dict:
         """
@@ -989,8 +1205,42 @@ class AgentApp:
 
     def _run_supervisor_cycle(self) -> None:
         self._scan_existing_clients()
+        self._evaluate_and_prioritize_clients()
         if self._auto_mode:
             self._scan_and_process_inbox()
+
+    def _evaluate_and_prioritize_clients(self) -> None:
+        clients = self._discover_clients()
+        if not clients:
+            return
+
+        ranked: list[tuple[tuple[int, float], str, dict, dict]] = []
+        for slug in clients:
+            evaluation = self._evaluate_client_state(slug)
+            priority = self._priority_rank(evaluation)
+            ranked.append((priority["sort_key"], slug, evaluation, priority))
+            self._persist_client_evaluation(slug, evaluation)
+            self._log_activity(
+                f"[SUPERVISOR] evaluation slug={slug} "
+                f"score={evaluation['overall_score']:.2f} "
+                f"priority={priority['bucket']}"
+            )
+
+        ranked.sort(key=lambda item: item[0])
+        for _, slug, evaluation, priority in ranked:
+            if evaluation["overall_score"] >= EVALUATION_THRESHOLD and not evaluation.get("source_changed", False):
+                self._log_activity(
+                    f"[SUPERVISOR] skipped slug={slug} reason=stable_above_threshold "
+                    f"score={evaluation['overall_score']:.2f}"
+                )
+                continue
+
+            reason = (
+                f"priority={priority['bucket']};"
+                f"issues={','.join(evaluation['issues_detected']) or 'none'};"
+                f"score={evaluation['overall_score']:.2f}"
+            )
+            self._schedule_client_supervisor_work(slug, reason)
 
     def _discover_clients(self) -> list[str]:
         self.paths["clients"].mkdir(parents=True, exist_ok=True)
