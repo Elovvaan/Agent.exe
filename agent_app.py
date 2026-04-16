@@ -42,6 +42,14 @@ REQUIRED_TEMPLATE_PLACEHOLDERS = (
     "{{CTA_PRIMARY}}",
     "{{CTA_SECONDARY}}",
 )
+INTELLIGENCE_PROFILE_FILENAME = "intelligence_profile.json"
+DEFAULT_INTELLIGENCE_PROFILE = {
+    "business_type_default": "Local Business",
+    "brand_style_default": "modern and professional",
+    "description_template": "Welcome to {name}. We provide quality services to our clients.",
+    "cta_primary_default": "Book a free call",
+    "cta_secondary_default": "See our services",
+}
 
 INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
 
@@ -448,6 +456,7 @@ class AgentApp:
         client_slug = self.sanitize_client_name(data.name)
         client_root = self.paths["clients"] / client_slug
         notes_file  = client_root / "notes" / "client.json"
+        profile_file = client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME
         try:
             if client_root.exists() or notes_file.exists():
                 overwrite = messagebox.askyesno(
@@ -464,6 +473,11 @@ class AgentApp:
 
             with notes_file.open("w", encoding="utf-8") as f:
                 json.dump(data.to_dict(), f, indent=2)
+            if not profile_file.exists():
+                profile_file.write_text(
+                    json.dumps(DEFAULT_INTELLIGENCE_PROFILE, indent=2),
+                    encoding="utf-8",
+                )
 
             self.refresh_client_list()
             self.selected_client = client_slug
@@ -505,6 +519,41 @@ class AgentApp:
         if client_root.exists() and client_root.is_dir():
             return client_root
         return None
+
+    def _load_client_intelligence_profile(self, client_slug: str) -> dict:
+        profile = dict(DEFAULT_INTELLIGENCE_PROFILE)
+        client_root = self._lookup_existing_client_root(client_slug)
+        if not client_root:
+            return profile
+
+        profile_file = client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME
+        if not profile_file.exists():
+            return profile
+        try:
+            data = json.loads(profile_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._log_activity(f"[PROFILE] load failed slug={client_slug}: {exc}")
+            return profile
+
+        if not isinstance(data, dict):
+            return profile
+        for key in DEFAULT_INTELLIGENCE_PROFILE:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                profile[key] = value.strip()
+        return profile
+
+    def _profile_description_for_name(self, profile: dict, name: str) -> str:
+        template = str(
+            profile.get("description_template", DEFAULT_INTELLIGENCE_PROFILE["description_template"])
+        ).strip()
+        if not template:
+            template = DEFAULT_INTELLIGENCE_PROFILE["description_template"]
+        try:
+            description = template.format(name=name)
+        except Exception:
+            description = DEFAULT_INTELLIGENCE_PROFILE["description_template"].format(name=name)
+        return description
 
     # ------------------------------------------------------------------ #
     #  Site generation
@@ -564,17 +613,18 @@ class AgentApp:
         if not is_valid:
             raise ValueError(validation_msg)
         slug = self.sanitize_client_name(name)
+        profile = self._load_client_intelligence_profile(slug)
 
         # ---- business_type ----
         business_type = _raw_text("business_type").strip()
         if not business_type:
-            business_type = "Local Business"
+            business_type = profile["business_type_default"]
             enriched.append("business_type")
 
         # ---- brand_style ----
         brand_style = _raw_text("brand_style").strip()
         if not brand_style:
-            brand_style = "modern and professional"
+            brand_style = profile["brand_style_default"]
             enriched.append("brand_style")
 
         # ---- email (normalize: lowercase + stripped) ----
@@ -596,7 +646,7 @@ class AgentApp:
         # ---- description (default if absent; truncate if over 500 chars) ----
         description = _raw_text("description").strip()
         if not description:
-            description = f"Welcome to {name}. We provide quality services to our clients."
+            description = self._profile_description_for_name(profile, name)
             enriched.append("description")
         elif len(description) > 500:
             description = description[:497] + "..."
@@ -605,13 +655,13 @@ class AgentApp:
         # ---- cta_primary ----
         cta_primary = _raw_text("cta_primary").strip()
         if not cta_primary:
-            cta_primary = "Book a free call"
+            cta_primary = profile["cta_primary_default"]
             enriched.append("cta_primary")
 
         # ---- cta_secondary ----
         cta_secondary = _raw_text("cta_secondary").strip()
         if not cta_secondary:
-            cta_secondary = "See our services"
+            cta_secondary = profile["cta_secondary_default"]
             enriched.append("cta_secondary")
 
         # ---- completeness score (measured against raw input, before enrichment) ----
@@ -794,6 +844,7 @@ class AgentApp:
         final_slug = client_analysis.slug
         copied = 0
         previous_memory = self._load_client_memory(final_slug)
+        profile = self._load_client_intelligence_profile(final_slug)
         previous_generated = previous_memory.get("generated_fields", {})
         previous_results = previous_memory.get("execution_results", {})
         execution_results: dict[str, str] = {}
@@ -811,9 +862,9 @@ class AgentApp:
             try:
                 if step == "ENRICH_DATA":
                     if not client_data.get("business_type", "").strip():
-                        client_data["business_type"] = "Local Business"
+                        client_data["business_type"] = profile["business_type_default"]
                     if not client_data.get("brand_style", "").strip():
-                        client_data["brand_style"] = "modern and professional"
+                        client_data["brand_style"] = profile["brand_style_default"]
 
                 elif step == "GENERATE_DESCRIPTION":
                     if not client_data.get("description", "").strip():
@@ -824,9 +875,9 @@ class AgentApp:
                             client_data["description"] = previous_generated["description"]
                             self._log_activity(f"[MEMORY] reused description slug={final_slug}")
                         else:
-                            client_data["description"] = (
-                                f"Welcome to {client_data['name']}. "
-                                "We provide quality services to our clients."
+                            client_data["description"] = self._profile_description_for_name(
+                                profile,
+                                client_data["name"],
                             )
 
                 elif step == "GENERATE_CTA":
@@ -838,7 +889,7 @@ class AgentApp:
                             client_data["cta_primary"] = previous_generated["cta_primary"]
                             self._log_activity(f"[MEMORY] reused cta_primary slug={final_slug}")
                         else:
-                            client_data["cta_primary"] = "Book a free call"
+                            client_data["cta_primary"] = profile["cta_primary_default"]
                     if not client_data.get("cta_secondary", "").strip():
                         if (
                             previous_results.get("GENERATE_CTA") == "success"
@@ -847,7 +898,7 @@ class AgentApp:
                             client_data["cta_secondary"] = previous_generated["cta_secondary"]
                             self._log_activity(f"[MEMORY] reused cta_secondary slug={final_slug}")
                         else:
-                            client_data["cta_secondary"] = "See our services"
+                            client_data["cta_secondary"] = profile["cta_secondary_default"]
 
                 elif step == "RESOLVE_SLUG":
                     final_slug = self._resolve_unique_slug(final_slug)
