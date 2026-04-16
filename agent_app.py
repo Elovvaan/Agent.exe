@@ -75,6 +75,7 @@ RETRY_EVENT_BUDGET_MULTIPLIER = 2
 MAX_RETRY_EVENT_BUDGET = 50
 EVENT_ROUTER_MAX_WAIT_SECONDS = 2.0
 EVENT_ROUTER_MAX_RETRIES = 2
+MAX_EVENT_HANDLER_FAILURES = 3
 
 EXECUTION_MODE_CONFIG = {
     "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
@@ -739,13 +740,13 @@ class AgentApp:
                     telemetry = self._runtime_bus.setdefault("telemetry", {})
                     telemetry["routing_retries"] = int(telemetry.get("routing_retries", 0)) + 1
                 self._queue_event(event, cycle_state.get("runtime", {}))
-            elif event_type != EVENT_OPTIMIZER_ESCALATION and failures <= 3:
+            elif event_type != EVENT_OPTIMIZER_ESCALATION and failures <= MAX_EVENT_HANDLER_FAILURES:
                 self._emit_event(
                     EVENT_OPTIMIZER_ESCALATION,
-                    {"task": event.get("payload", {}).get("task", {}), "reason": f"event_handler_failure:{type(exc).__name__}:{exc}"},
+                    {"task": event.get("payload", {}).get("task", {}), "reason": f"event_handler_failure:{type(exc).__name__}"},
                     cycle_state=cycle_state,
                 )
-            if failures > 3:
+            if failures > MAX_EVENT_HANDLER_FAILURES:
                 cycle_state["fallback_phase18"] = True
                 self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
         finally:
@@ -759,17 +760,18 @@ class AgentApp:
         if not isinstance(futures, list) or not futures:
             return
         deadline = time.perf_counter() + max(0.0, timeout_seconds)
-        pending: list = []
+        incomplete_futures: list = []
         for future in futures:
             remaining = max(0.0, deadline - time.perf_counter())
             if remaining <= 0:
-                pending.append(future)
+                if not future.done():
+                    incomplete_futures.append(future)
                 continue
             try:
                 future.result(timeout=remaining)
             except Exception as exc:
                 self._log_activity(f"[EVENT] async_wait_failed error={type(exc).__name__}:{exc}")
-        cycle_state["routing_futures"] = pending
+        cycle_state["routing_futures"] = incomplete_futures
 
     def _emit_event(self, event_type: str, payload: dict, cycle_state: dict | None = None) -> None:
         if event_type not in SUPPORTED_EVENT_TYPES:
@@ -1061,9 +1063,9 @@ class AgentApp:
                 self._log_activity(f"[EVENT] handler_failed event={event.get('event_type', '')} error={exc}")
                 failures = int(cycle_state.get("event_failures", 0)) + 1
                 cycle_state["event_failures"] = failures
-                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= 3:
+                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= MAX_EVENT_HANDLER_FAILURES:
                     self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"}, cycle_state=cycle_state)
-                if failures > 3:
+                if failures > MAX_EVENT_HANDLER_FAILURES:
                     self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
                     break
             processed += 1
@@ -5162,7 +5164,7 @@ class AgentApp:
         """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
-        self._event_handler_pool.shutdown(wait=False, cancel_futures=True)
+        self._event_handler_pool.shutdown(wait=True, cancel_futures=False)
         self._graceful_shutdown_runtime()
         self._join_background_threads(timeout=2.0)
         self.root.destroy()
