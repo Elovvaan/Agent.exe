@@ -67,6 +67,12 @@ FORCED_PROGRESS_CYCLE_THRESHOLD = 3
 FORCED_PROGRESS_VALUE_THRESHOLD_SCALE = 0.75
 FORCED_PROGRESS_COST_TOLERANCE_SCALE = 1.35
 FORCED_PROGRESS_MAX_EXPLORATORY_TASKS = 2
+MIN_CYCLE_EVENT_BUDGET = 20
+CYCLE_EVENT_BUDGET_MULTIPLIER = 10
+MAX_CYCLE_EVENT_BUDGET = 200
+MIN_RETRY_EVENT_BUDGET = 5
+RETRY_EVENT_BUDGET_MULTIPLIER = 2
+MAX_RETRY_EVENT_BUDGET = 50
 
 EXECUTION_MODE_CONFIG = {
     "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
@@ -602,7 +608,7 @@ class AgentApp:
             "started_at": str(task.get("started_at", "")),
             "completed_at": str(task.get("completed_at", "")),
             "verification_status": str(task.get("verification_status", "")),
-            "exploration_task": bool(task.get("exploration_task", task.get("exploration_tasks", False))),
+            "exploration_task": bool(task.get("exploration_task", False)),
             "runtime_session_id": runtime_session_id,
         }
         with self._runtime_bus_lock:
@@ -652,12 +658,26 @@ class AgentApp:
             )
         results: list[dict] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._execute_goal_task_worker, task) for task in ordered_tasks]
-            for future in futures:
+            futures = {pool.submit(self._execute_goal_task_worker, task): task for task in ordered_tasks}
+            for future, submitted_task in futures.items():
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    self._log_activity(f"[TASK] worker_failed error={exc}")
+                    self._log_activity(f"[TASK] worker_failed task_id={submitted_task.get('task_id', '')} error={type(exc).__name__}:{exc}")
+                    results.append(
+                        {
+                            "task": submitted_task,
+                            "runtime_session_id": str(submitted_task.get("runtime_session_id", "")),
+                            "run_result": f"failed:{type(exc).__name__}:{exc}",
+                            "status": "failed",
+                            "compute_units": {
+                                "reasoning_calls": 0,
+                                "generations": 0,
+                                "execution_seconds": 0.0,
+                                "total": 0.0,
+                            },
+                        }
+                    )
         dispatch_latency = round(max(0.0, time.perf_counter() - dispatch_started), 3)
         execution_latency = 0.0
         if results:
@@ -779,7 +799,7 @@ class AgentApp:
                 after = self._safe_float(progress.get("current_score", 0.0), 0.0)
                 if after > before:
                     cycle_state["progress_advanced"] = True
-                if task.get("exploration_tasks", False):
+                if task.get("exploration_task", False):
                     task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
                     efficiency = self._system_learning_state.setdefault("task_efficiency", {})
                     stats = efficiency.setdefault(task_type, {}) if isinstance(efficiency, dict) else {}
@@ -793,7 +813,7 @@ class AgentApp:
         if event_type == EVENT_EXPLORATION_NEEDED:
             task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
             if task:
-                task["exploration_tasks"] = True
+                task["exploration_task"] = True
                 self._emit_event(EVENT_TASK_READY, {"task": task})
             return
         if event_type == EVENT_OPTIMIZER_ESCALATION:
@@ -837,7 +857,13 @@ class AgentApp:
                 self._handle_event(event, cycle_state)
             except Exception as exc:
                 self._log_activity(f"[EVENT] handler_failed event={event.get('event_type', '')} error={exc}")
-                self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"})
+                failures = int(cycle_state.get("event_failures", 0)) + 1
+                cycle_state["event_failures"] = failures
+                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= 3:
+                    self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"})
+                if failures > 3:
+                    self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
+                    break
             processed += 1
         return processed
 
@@ -3228,7 +3254,10 @@ class AgentApp:
         try:
             self._run_goal_supervisor_event_cycle()
         except Exception as exc:
-            self._log_activity(f"[EVENT] cycle_failed error={exc} fallback=deterministic")
+            self._log_activity(
+                f"[EVENT] cycle_failed error={type(exc).__name__}:{exc} fallback=deterministic\n"
+                f"{traceback.format_exc()}"
+            )
             self._run_goal_supervisor_cycle()
         if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
             self._run_system_learning_cycle()
@@ -3619,7 +3648,8 @@ class AgentApp:
             if decision["decision"] == "prioritize":
                 task["priority_score"] = round(self._safe_float(task.get("priority_score", 0.0), 0.0) + 500.0, 3)
             task["exploration_tasks"] = bool(decision.get("exploration_tasks", False))
-            if task["exploration_tasks"] and forced_progress["exploratory_slots"] > 0:
+            task["exploration_task"] = task["exploration_tasks"]
+            if task["exploration_task"] and forced_progress["exploratory_slots"] > 0:
                 forced_progress["exploratory_slots"] -= 1
             filtered.append(task)
 
@@ -3633,6 +3663,7 @@ class AgentApp:
         if not selected and queued and forced_progress["active"]:
             fallback = queued.pop(0)
             fallback["exploration_tasks"] = True
+            fallback["exploration_task"] = True
             fallback["execution_decision"] = {
                 "decision": "execute",
                 "reason": "forced_progress_no_stall",
@@ -4019,9 +4050,12 @@ class AgentApp:
                 "score_gap": progress.get("score_gap", 0.0),
                 "goal_priority": self._safe_float(goal.get("priority", goal.get("priority_score", 5.0)), 5.0),
                 "runtime_session_id": str(session.get("runtime_session_id", "")),
+                "exploration_task": False,
             }
             tasks.append(task)
         runnable, queued, skipped = self._schedule_tasks(tasks, runtime, goals_by_id)
+        for task in runnable + queued + skipped:
+            task["exploration_task"] = bool(task.get("exploration_task", False))
         for task in skipped:
             self._log_activity(
                 f"[TASK] skipped task_id={task['task_id']} goal_id={task['goal_id']} "
@@ -4046,11 +4080,14 @@ class AgentApp:
             self._emit_event(EVENT_TASK_READY, {"task": task})
         if not runnable and queued and runtime.get("forced_progress_active", False):
             self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
-        cycle_budget = max(20, int(runtime.get("max_concurrent_tasks", 5)) * 10)
+        cycle_budget = max(MIN_CYCLE_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * CYCLE_EVENT_BUDGET_MULTIPLIER)
+        cycle_budget = min(MAX_CYCLE_EVENT_BUDGET, cycle_budget)
         self._drain_event_queue(cycle_state, cycle_budget)
         if not cycle_state["progress_advanced"] and queued:
             self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
-            self._drain_event_queue(cycle_state, max(5, int(runtime.get("max_concurrent_tasks", 5)) * 2))
+            retry_budget = max(MIN_RETRY_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * RETRY_EVENT_BUDGET_MULTIPLIER)
+            retry_budget = min(MAX_RETRY_EVENT_BUDGET, retry_budget)
+            self._drain_event_queue(cycle_state, retry_budget)
         if cycle_state["goal_completion_recorded"] or cycle_state["progress_advanced"]:
             runtime["cycles_since_progress"] = 0
         else:
@@ -4773,8 +4810,9 @@ class AgentApp:
         with self._runtime_bus_lock:
             runtime["pending_events"] = list(self._runtime_bus.get("pending_events", []))
             runtime["runtime_sessions"] = dict(self._runtime_bus.get("runtime_sessions", {}))
-            self._runtime_bus["pending_events"] = []
         self._persist_runtime_checkpoint("before_shutdown", runtime)
+        with self._runtime_bus_lock:
+            self._runtime_bus["pending_events"] = []
 
     def _on_close(self) -> None:
         """Signal background work to stop, wait briefly, then destroy the window."""
