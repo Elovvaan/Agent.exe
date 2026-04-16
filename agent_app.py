@@ -163,7 +163,7 @@ class AgentApp:
         self._stop_event = threading.Event()
         self._auto_lock  = threading.Lock()
         self._stats      = {"found": 0, "processed": 0, "errors": 0}
-        self._known_clients: tuple[str, ...] = tuple()
+        self._known_clients: list[str] = []
 
         self._ensure_core_structure()
         self._build_ui()
@@ -307,14 +307,16 @@ class AgentApp:
     def refresh_client_list(self) -> None:
         self.client_list.delete(0, END)
         client_names = self._discover_clients()
-        for name in client_names:
+        selected_index = None
+        for idx, name in enumerate(client_names):
             self.client_list.insert(END, name)
-        self._known_clients = tuple(client_names)
+            if name == self.selected_client:
+                selected_index = idx
+        self._known_clients = client_names
 
-        if self.selected_client in client_names:
-            idx = client_names.index(self.selected_client)
-            self.client_list.selection_set(idx)
-            self.client_list.activate(idx)
+        if selected_index is not None:
+            self.client_list.selection_set(selected_index)
+            self.client_list.activate(selected_index)
         elif self.selected_client is not None:
             self.selected_client = None
 
@@ -1002,7 +1004,7 @@ class AgentApp:
             return []
 
     def _scan_existing_clients(self) -> None:
-        clients = tuple(self._discover_clients())
+        clients = self._discover_clients()
         if clients == self._known_clients:
             return
         self._known_clients = clients
