@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -66,6 +67,12 @@ FORCED_PROGRESS_CYCLE_THRESHOLD = 3
 FORCED_PROGRESS_VALUE_THRESHOLD_SCALE = 0.75
 FORCED_PROGRESS_COST_TOLERANCE_SCALE = 1.35
 FORCED_PROGRESS_MAX_EXPLORATORY_TASKS = 2
+MIN_CYCLE_EVENT_BUDGET = 20
+CYCLE_EVENT_BUDGET_MULTIPLIER = 10
+MAX_CYCLE_EVENT_BUDGET = 200
+MIN_RETRY_EVENT_BUDGET = 5
+RETRY_EVENT_BUDGET_MULTIPLIER = 2
+MAX_RETRY_EVENT_BUDGET = 50
 
 EXECUTION_MODE_CONFIG = {
     "balanced": {"value_threshold": 0.45, "cost_multiplier": 1.0, "allow_budget_override": False},
@@ -108,6 +115,29 @@ TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
+TASK_STATUS_INTERRUPTED = "interrupted"
+EVENT_TASK_READY = "task_ready"
+EVENT_TASK_ASSIGNED = "task_assigned"
+EVENT_TASK_STARTED = "task_started"
+EVENT_TASK_COMPLETED = "task_completed"
+EVENT_TASK_FAILED = "task_failed"
+EVENT_VERIFICATION_PASSED = "verification_passed"
+EVENT_VERIFICATION_FAILED = "verification_failed"
+EVENT_GOAL_PROGRESS_UPDATED = "goal_progress_updated"
+EVENT_EXPLORATION_NEEDED = "exploration_needed"
+EVENT_OPTIMIZER_ESCALATION = "optimizer_escalation"
+SUPPORTED_EVENT_TYPES = {
+    EVENT_TASK_READY,
+    EVENT_TASK_ASSIGNED,
+    EVENT_TASK_STARTED,
+    EVENT_TASK_COMPLETED,
+    EVENT_TASK_FAILED,
+    EVENT_VERIFICATION_PASSED,
+    EVENT_VERIFICATION_FAILED,
+    EVENT_GOAL_PROGRESS_UPDATED,
+    EVENT_EXPLORATION_NEEDED,
+    EVENT_OPTIMIZER_ESCALATION,
+}
 DEFAULT_ACTION_POLICY = {
     "allowed_actions": [ACTION_FILE_WRITE, ACTION_NO_OP],
     "allowed_domains": [],
@@ -262,6 +292,7 @@ class AgentApp:
             "system_score_trend": [],
             "agent_learning_signals": [],
             "task_efficiency": {},
+            "runtime_telemetry": [],
             "verification_metrics": {
                 "task_type": {},
                 "agent_role": {},
@@ -282,8 +313,12 @@ class AgentApp:
             "cycle_history": [],
             "cycles_since_progress": 0,
             "last_goal_completion_time": "",
+            "runtime_sessions": {},
+            "telemetry": {},
         }
         self._task_round_robin_cursor = 0
+        self._runtime_bus_lock = threading.Lock()
+        self._runtime_bus = self._initialize_runtime_bus()
 
         self._ensure_core_structure()
         self._load_system_learning_state()
@@ -343,6 +378,25 @@ class AgentApp:
     def _system_runtime_file(self) -> Path:
         return self.paths["notes"] / "system_runtime.json"
 
+    def _initialize_runtime_bus(self) -> dict:
+        return {
+            "goals": {},
+            "tasks": {},
+            "agent_states": {},
+            "runtime_sessions": {},
+            "pending_events": [],
+            "telemetry": {
+                "event_queue_depth": 0,
+                "task_dispatch_latency": 0.0,
+                "task_execution_latency": 0.0,
+                "verification_latency": 0.0,
+                "session_cache_hits": 0,
+                "session_cache_misses": 0,
+                "session_efficiency_gain": 0.0,
+                "cycle_wall_clock_time": 0.0,
+            },
+        }
+
     def _persist_system_goals(self, payload: dict) -> None:
         serialized = payload if isinstance(payload, dict) else {"active_goals": []}
         self._system_goals_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
@@ -363,6 +417,8 @@ class AgentApp:
             "cycle_history": [],
             "cycles_since_progress": 0,
             "last_goal_completion_time": "",
+            "runtime_sessions": {},
+            "telemetry": {},
         }
         runtime_file = self._system_runtime_file()
         if not runtime_file.exists():
@@ -385,6 +441,8 @@ class AgentApp:
                 "cycle_history": payload.get("cycle_history", []) if isinstance(payload.get("cycle_history", []), list) else [],
                 "cycles_since_progress": max(0, int(payload.get("cycles_since_progress", 0))),
                 "last_goal_completion_time": str(payload.get("last_goal_completion_time", "")).strip(),
+                "runtime_sessions": payload.get("runtime_sessions", {}) if isinstance(payload.get("runtime_sessions", {}), dict) else {},
+                "telemetry": payload.get("telemetry", {}) if isinstance(payload.get("telemetry", {}), dict) else {},
             }
             mode = self._system_runtime_state["execution_mode"]
             if mode not in EXECUTION_MODE_CONFIG:
@@ -397,6 +455,13 @@ class AgentApp:
         except Exception as exc:
             self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
             self._system_runtime_state = default_runtime
+        with self._runtime_bus_lock:
+            sessions = self._system_runtime_state.get("runtime_sessions", {})
+            if isinstance(sessions, dict):
+                self._runtime_bus["runtime_sessions"] = dict(sessions)
+            telemetry = self._system_runtime_state.get("telemetry", {})
+            if isinstance(telemetry, dict):
+                self._runtime_bus["telemetry"].update(telemetry)
         return self._system_runtime_state
 
     def _persist_system_runtime(self, payload: dict | None = None) -> None:
@@ -413,6 +478,8 @@ class AgentApp:
             "cycle_history": runtime.get("cycle_history", [])[-80:] if isinstance(runtime.get("cycle_history", []), list) else [],
             "cycles_since_progress": max(0, int(runtime.get("cycles_since_progress", 0))),
             "last_goal_completion_time": str(runtime.get("last_goal_completion_time", "")).strip(),
+            "runtime_sessions": runtime.get("runtime_sessions", {}) if isinstance(runtime.get("runtime_sessions", {}), dict) else {},
+            "telemetry": runtime.get("telemetry", {}) if isinstance(runtime.get("telemetry", {}), dict) else {},
         }
         if serialized["execution_mode"] not in EXECUTION_MODE_CONFIG:
             serialized["execution_mode"] = "balanced"
@@ -432,6 +499,391 @@ class AgentApp:
         }
         self._system_runtime_state = serialized
         self._system_runtime_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+
+    def _record_runtime_telemetry(self, runtime: dict, updates: dict) -> None:
+        telemetry = runtime.get("telemetry", {})
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+        for key, value in updates.items():
+            telemetry[key] = value
+        hits = int(telemetry.get("session_cache_hits", 0))
+        misses = int(telemetry.get("session_cache_misses", 0))
+        total = hits + misses
+        telemetry["session_efficiency_gain"] = round(hits / total, 3) if total > 0 else 0.0
+        runtime["telemetry"] = telemetry
+        with self._runtime_bus_lock:
+            self._runtime_bus.setdefault("telemetry", {}).update(telemetry)
+        trend = self._system_learning_state.get("runtime_telemetry", [])
+        if not isinstance(trend, list):
+            trend = []
+        trend.append({"timestamp": datetime.now().isoformat(timespec="seconds"), **telemetry})
+        self._system_learning_state["runtime_telemetry"] = trend[-120:]
+
+    def _compute_client_source_signature(self, slug: str) -> str:
+        client_root = self.paths["clients"] / slug
+        observed: list[str] = []
+        for path in (
+            client_root / "notes" / "client.json",
+            client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME,
+            client_root / "memory.json",
+        ):
+            if path.exists():
+                stat = path.stat()
+                observed.append(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size}")
+            else:
+                observed.append(f"{path.name}:missing")
+        payload = "|".join(observed)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _get_runtime_session(self, slug: str) -> dict:
+        with self._runtime_bus_lock:
+            sessions = self._runtime_bus.setdefault("runtime_sessions", {})
+            current = sessions.get(slug, {})
+            if not isinstance(current, dict):
+                current = {}
+            if not current:
+                current = {
+                    "runtime_session_id": f"{slug}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    "client_slug": slug,
+                    "source_signature": "",
+                    "cached_context": {},
+                    "cached_evaluation": {},
+                    "warm_state": {"cache_hits": 0, "cache_misses": 0},
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                sessions[slug] = current
+            return current
+
+    def _get_client_context_from_session(self, slug: str, raw_client_data: dict | None = None) -> tuple[dict, dict]:
+        runtime = self._load_system_runtime()
+        session = self._get_runtime_session(slug)
+        source_signature = self._compute_client_source_signature(slug)
+        cached_context = session.get("cached_context", {}) if isinstance(session.get("cached_context", {}), dict) else {}
+        if (
+            not raw_client_data
+            and cached_context
+            and str(session.get("source_signature", "")) == source_signature
+        ):
+            warm = session.setdefault("warm_state", {})
+            warm["cache_hits"] = int(warm.get("cache_hits", 0)) + 1
+            self._record_runtime_telemetry(
+                runtime,
+                {
+                    "session_cache_hits": int(runtime.get("telemetry", {}).get("session_cache_hits", 0)) + 1,
+                    "session_cache_misses": int(runtime.get("telemetry", {}).get("session_cache_misses", 0)),
+                },
+            )
+            return cached_context, session
+        context = self._build_client_context(slug, raw_client_data)
+        session["cached_context"] = context
+        session["source_signature"] = source_signature
+        session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        warm = session.setdefault("warm_state", {})
+        warm["cache_misses"] = int(warm.get("cache_misses", 0)) + 1
+        self._record_runtime_telemetry(
+            runtime,
+            {
+                "session_cache_hits": int(runtime.get("telemetry", {}).get("session_cache_hits", 0)),
+                "session_cache_misses": int(runtime.get("telemetry", {}).get("session_cache_misses", 0)) + 1,
+            },
+        )
+        return context, session
+
+    def _persist_runtime_checkpoint(self, checkpoint: str, runtime: dict | None = None) -> None:
+        payload = runtime if isinstance(runtime, dict) else self._load_system_runtime()
+        payload["last_checkpoint"] = {
+            "name": checkpoint,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        with self._runtime_bus_lock:
+            payload["runtime_sessions"] = dict(self._runtime_bus.get("runtime_sessions", {}))
+            payload["pending_events"] = list(self._runtime_bus.get("pending_events", []))
+            payload["telemetry"] = dict(self._runtime_bus.get("telemetry", {}))
+        self._persist_system_runtime(payload)
+        self._persist_system_learning_state()
+
+    def _emit_event(self, event_type: str, payload: dict) -> None:
+        if event_type not in SUPPORTED_EVENT_TYPES:
+            return
+        event = {
+            "event_type": event_type,
+            "payload": payload if isinstance(payload, dict) else {},
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        with self._runtime_bus_lock:
+            queue = self._runtime_bus.setdefault("pending_events", [])
+            queue.append(event)
+            self._runtime_bus["telemetry"]["event_queue_depth"] = len(queue)
+
+    def _register_runtime_task(self, task: dict, runtime_session_id: str) -> None:
+        record = {
+            "task_id": str(task.get("task_id", "")),
+            "client_slug": str(task.get("client_slug", "")),
+            "goal_id": str(task.get("goal_id", "")),
+            "assigned_agent": str(task.get("assigned_agent", "")),
+            "priority_score": self._safe_float(task.get("priority_score", 0.0), 0.0),
+            "status": str(task.get("status", TASK_STATUS_PENDING)),
+            "started_at": str(task.get("started_at", "")),
+            "completed_at": str(task.get("completed_at", "")),
+            "verification_status": str(task.get("verification_status", "")),
+            "exploration_task": bool(task.get("exploration_task", False)),
+            "runtime_session_id": runtime_session_id,
+        }
+        with self._runtime_bus_lock:
+            self._runtime_bus.setdefault("tasks", {})[record["task_id"]] = record
+
+    def _execute_goal_task_worker(self, task: dict) -> dict:
+        slug = str(task.get("client_slug", "")).strip()
+        if not slug:
+            return {"status": "failed", "error": "missing_client_slug", "task": task}
+        context, runtime_session = self._get_client_context_from_session(slug)
+        before_memory = self._load_client_memory(slug)
+        before_reasoning = int(before_memory.get("reasoning_history", {}).get("total_calls", 0)) if isinstance(before_memory.get("reasoning_history", {}), dict) else 0
+        started = time.perf_counter()
+        execution = self._schedule_client_supervisor_work(slug, task.get("reason", "goal_supervisor"), context=context, runtime_session=runtime_session)
+        elapsed = round(max(0.0, time.perf_counter() - started), 3)
+        after_memory = self._load_client_memory(slug)
+        after_reasoning = int(after_memory.get("reasoning_history", {}).get("total_calls", 0)) if isinstance(after_memory.get("reasoning_history", {}), dict) else 0
+        generated_fields = after_memory.get("generated_fields", {}) if isinstance(after_memory.get("generated_fields", {}), dict) else {}
+        generations = sum(1 for value in generated_fields.values() if str(value).strip())
+        reasoning_calls = max(0, after_reasoning - before_reasoning)
+        run_status = str(execution.get("status", "failed"))
+        run_result = "executed" if run_status == "processed" else ("skipped" if run_status == "skipped" else f"failed:{execution.get('error', 'unknown_error')}")
+        return {
+            "task": task,
+            "execution": execution,
+            "runtime_session_id": str(runtime_session.get("runtime_session_id", "")),
+            "run_result": run_result,
+            "status": "success" if run_result in {"executed", "skipped"} else "failed",
+            "compute_units": {
+                "reasoning_calls": reasoning_calls,
+                "generations": generations,
+                "execution_seconds": elapsed,
+                "total": round(reasoning_calls + generations + elapsed, 3),
+            },
+        }
+
+    def _execute_task_batch_parallel(self, tasks: list[dict], runtime: dict) -> list[dict]:
+        if not tasks:
+            return []
+        workers = max(1, min(int(runtime.get("max_concurrent_tasks", 5)), len(tasks)))
+        ordered_tasks = sorted(tasks, key=lambda task: str(task.get("task_id", "")))
+        dispatch_started = time.perf_counter()
+        for task in ordered_tasks:
+            self._log_activity(
+                f"[TASK] start task_id={task['task_id']} goal_id={task['goal_id']} slug={task['client_slug']} "
+                f"priority={task['priority_score']:.2f} agent={task.get('assigned_agent', 'unassigned')}"
+            )
+        results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._execute_goal_task_worker, task): task for task in ordered_tasks}
+            for future, submitted_task in futures.items():
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    self._log_activity(f"[TASK] worker_failed task_id={submitted_task.get('task_id', '')} error={type(exc).__name__}:{exc}")
+                    results.append(
+                        {
+                            "task": submitted_task,
+                            "runtime_session_id": str(submitted_task.get("runtime_session_id", "")),
+                            "run_result": f"failed:{type(exc).__name__}:{exc}",
+                            "status": "failed",
+                            "compute_units": {
+                                "reasoning_calls": 0,
+                                "generations": 0,
+                                "execution_seconds": 0.0,
+                                "total": 0.0,
+                            },
+                        }
+                    )
+        dispatch_latency = round(max(0.0, time.perf_counter() - dispatch_started), 3)
+        execution_latency = 0.0
+        if results:
+            execution_latency = round(
+                sum(self._safe_float(item.get("compute_units", {}).get("execution_seconds", 0.0), 0.0) for item in results) / len(results),
+                3,
+            )
+        self._record_runtime_telemetry(
+            runtime,
+            {
+                "task_dispatch_latency": dispatch_latency,
+                "task_execution_latency": execution_latency,
+                "event_queue_depth": len(self._runtime_bus.get("pending_events", [])),
+            },
+        )
+        return results
+
+    def _handle_event(self, event: dict, cycle_state: dict) -> None:
+        runtime = cycle_state["runtime"]
+        event_type = str(event.get("event_type", ""))
+        payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
+        if event_type == EVENT_TASK_READY:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            if task:
+                self._emit_event(EVENT_TASK_ASSIGNED, {"task": task})
+            return
+        if event_type == EVENT_TASK_ASSIGNED:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            if not task:
+                return
+            remaining_before_start = self._remaining_budget(runtime)
+            est_cost = self._safe_float(task.get("cost_estimate", {}).get("estimated_units", 0.0), 0.0)
+            cost_multiplier = self._safe_float(runtime.get("cost_multiplier", 1.0), 1.0)
+            adjusted_est_cost = est_cost * cost_multiplier
+            allow_override = (
+                task.get("execution_decision", {}).get("reason") == "aggressive_budget_override"
+                and str(runtime.get("execution_mode", "balanced")).strip().lower() == "aggressive"
+            )
+            if adjusted_est_cost > remaining_before_start and not allow_override:
+                self._log_activity(
+                    f"[TASK] deferred task_id={task['task_id']} reason=budget_guard "
+                    f"estimated={adjusted_est_cost:.2f} remaining={remaining_before_start:.2f}"
+                )
+                return
+            assigned = self._assign_agent(task, runtime)
+            if not assigned:
+                self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"task": task, "reason": "agent_pool_saturated"})
+                return
+            task["assigned_agent"] = assigned
+            task["status"] = TASK_STATUS_RUNNING
+            task["started_at"] = datetime.now().isoformat(timespec="seconds")
+            self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
+            if self._log_task_start(task, runtime):
+                self._emit_event(EVENT_TASK_STARTED, {"task": task})
+            return
+        if event_type == EVENT_TASK_STARTED:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            if task:
+                cycle_state.setdefault("dispatch_tasks", []).append(task)
+            return
+        if event_type == EVENT_TASK_COMPLETED or event_type == EVENT_TASK_FAILED:
+            started_verification = time.perf_counter()
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            completion = payload.get("completion", {}) if isinstance(payload.get("completion", {}), dict) else {}
+            if not task:
+                return
+            task["status"] = TASK_STATUS_COMPLETED if event_type == EVENT_TASK_COMPLETED else TASK_STATUS_FAILED
+            task["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            self._log_task_complete(task, completion, runtime)
+            verification_passed = bool(completion.get("verification", {}).get("passed", False))
+            task["verification_status"] = "passed" if verification_passed else "failed"
+            self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
+            self._emit_event(EVENT_VERIFICATION_PASSED if verification_passed else EVENT_VERIFICATION_FAILED, {"task": task, "completion": completion})
+            goal_id = str(task.get("goal_id", ""))
+            goal = cycle_state["goals_by_id"].get(goal_id, {})
+            slug = str(task.get("client_slug", "")).strip()
+            if slug and goal:
+                post_eval = self._evaluate_client_state(slug)
+                self._persist_client_evaluation(slug, post_eval)
+                cached_context, _ = self._get_client_context_from_session(slug)
+                cached_context["evaluation"] = post_eval
+                progress = self._evaluate_goal_progress(goal, cached_context)
+                self._emit_event(EVENT_GOAL_PROGRESS_UPDATED, {"task": task, "progress": progress, "run_result": completion.get("run_result", "failed")})
+            self._record_runtime_telemetry(runtime, {"verification_latency": round(max(0.0, time.perf_counter() - started_verification), 3)})
+            return
+        if event_type == EVENT_VERIFICATION_FAILED:
+            cycle_state["verification_failures"] = cycle_state.get("verification_failures", 0) + 1
+            self._persist_runtime_checkpoint("after_verification_failures", runtime)
+            return
+        if event_type == EVENT_GOAL_PROGRESS_UPDATED:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            progress = payload.get("progress", {}) if isinstance(payload.get("progress", {}), dict) else {}
+            run_result = str(payload.get("run_result", "failed"))
+            goal_id = str(task.get("goal_id", ""))
+            if goal_id and progress:
+                now = datetime.now().isoformat(timespec="seconds")
+                status = GOAL_STATUS_ACTIVE
+                completion_state = "in_progress"
+                if progress.get("complete", False):
+                    status = GOAL_STATUS_COMPLETED
+                    completion_state = "target_met"
+                elif run_result.startswith("failed"):
+                    status = GOAL_STATUS_BLOCKED if progress.get("blocked", False) else GOAL_STATUS_ACTIVE
+                    completion_state = "execution_failed"
+                updates = {
+                    "progress": progress.get("progress_percent", 0),
+                    "status": status,
+                    "blocked": bool(progress.get("blocked", False)),
+                    "last_run": now,
+                    "completion_state": completion_state,
+                    "last_result": run_result,
+                }
+                if status == GOAL_STATUS_COMPLETED:
+                    updates["completed_at"] = now
+                    cycle_state["goal_completion_recorded"] = True
+                    self._persist_runtime_checkpoint("after_goal_completion", runtime)
+                self._update_goal_record(goal_id, updates)
+                before = self._safe_float(task.get("progress", {}).get("current_score", 0.0), 0.0)
+                after = self._safe_float(progress.get("current_score", 0.0), 0.0)
+                if after > before:
+                    cycle_state["progress_advanced"] = True
+                if task.get("exploration_task", False):
+                    task_type = "goal_recovery" if task.get("repeated_failure", False) else "goal_progress"
+                    efficiency = self._system_learning_state.setdefault("task_efficiency", {})
+                    stats = efficiency.setdefault(task_type, {}) if isinstance(efficiency, dict) else {}
+                    if isinstance(stats, dict):
+                        if after > before:
+                            stats["value_return"] = round(min(1.0, self._safe_float(stats.get("value_return", 0.5), 0.5) + 0.05), 3)
+                        else:
+                            stats["value_return"] = round(max(0.0, self._safe_float(stats.get("value_return", 0.5), 0.5) - 0.04), 3)
+                            task["priority_score"] = round(max(0.0, self._safe_float(task.get("priority_score", 0.0), 0.0) * 0.9), 3)
+            return
+        if event_type == EVENT_EXPLORATION_NEEDED:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            if task:
+                task["exploration_task"] = True
+                self._emit_event(EVENT_TASK_READY, {"task": task})
+            return
+        if event_type == EVENT_OPTIMIZER_ESCALATION:
+            task = payload.get("task", {}) if isinstance(payload.get("task", {}), dict) else {}
+            self._log_activity(
+                f"[TASK] optimizer_escalation task_id={task.get('task_id', '')} reason={payload.get('reason', 'unspecified')}"
+            )
+
+    def _drain_event_queue(self, cycle_state: dict, cycle_budget: int) -> int:
+        processed = 0
+        while processed < cycle_budget:
+            event = None
+            with self._runtime_bus_lock:
+                queue = self._runtime_bus.setdefault("pending_events", [])
+                if queue:
+                    event = queue.pop(0)
+                    self._runtime_bus["telemetry"]["event_queue_depth"] = len(queue)
+            if event is None:
+                pending_dispatch = cycle_state.get("dispatch_tasks", [])
+                if pending_dispatch:
+                    task_results = self._execute_task_batch_parallel(pending_dispatch[:], cycle_state["runtime"])
+                    cycle_state["dispatch_tasks"] = []
+                    self._persist_runtime_checkpoint("after_task_completion_batch", cycle_state["runtime"])
+                    for result in task_results:
+                        task = result.get("task", {})
+                        completion = {
+                            "status": result.get("status", "failed"),
+                            "run_result": result.get("run_result", "failed"),
+                            "runtime_session_id": result.get("runtime_session_id", ""),
+                            "compute_units_used": result.get("compute_units", {}),
+                            "verifiable_result": {
+                                "type": ACTION_COMMAND,
+                                "exit_code": 0 if result.get("status") == "success" else 1,
+                                "output_valid": result.get("status") == "success",
+                            },
+                        }
+                        self._emit_event(EVENT_TASK_COMPLETED if result.get("status") == "success" else EVENT_TASK_FAILED, {"task": task, "completion": completion})
+                    continue
+                break
+            try:
+                self._handle_event(event, cycle_state)
+            except Exception as exc:
+                self._log_activity(f"[EVENT] handler_failed event={event.get('event_type', '')} error={exc}")
+                failures = int(cycle_state.get("event_failures", 0)) + 1
+                cycle_state["event_failures"] = failures
+                if event.get("event_type") != EVENT_OPTIMIZER_ESCALATION and failures <= 3:
+                    self._emit_event(EVENT_OPTIMIZER_ESCALATION, {"reason": f"event_handler_failure:{exc}"})
+                if failures > 3:
+                    self._log_activity("[EVENT] circuit_breaker_open reason=excessive_handler_failures")
+                    break
+            processed += 1
+        return processed
 
     def _create_agent_pool(self, max_concurrent_tasks: int) -> dict[str, int]:
         capacity = max(1, int(max_concurrent_tasks))
@@ -2130,24 +2582,32 @@ class AgentApp:
         memory["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._update_client_memory(slug, memory)
 
-    def _schedule_client_supervisor_work(self, slug: str, reason: str) -> dict:
+    def _schedule_client_supervisor_work(
+        self,
+        slug: str,
+        reason: str,
+        context: dict | None = None,
+        runtime_session: dict | None = None,
+    ) -> dict:
         client_root = self.paths["clients"] / slug
         notes_file = client_root / "notes" / "client.json"
         if not notes_file.exists():
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} skipped=missing_notes")
             return {"status": "skipped", "execution_results": {}}
         try:
-            raw_data = json.loads(notes_file.read_text(encoding="utf-8"))
-            raw_data["overwrite"] = True
-            context = self._build_client_context(slug, raw_data)
-            analysis = self._analyze_client(context["analysis_input"], context=context)
-            execution = self._execute_action_plan(analysis, context=context)
+            execution_context = context if isinstance(context, dict) and context else None
+            if execution_context is None:
+                raw_data = json.loads(notes_file.read_text(encoding="utf-8"))
+                raw_data["overwrite"] = True
+                execution_context = self._build_client_context(slug, raw_data)
+            analysis = self._analyze_client(execution_context["analysis_input"], context=execution_context)
+            execution = self._execute_action_plan(analysis, context=execution_context)
             final_analysis: ClientAnalysis = execution["analysis"]
             client_data: dict = execution["client_data"]
             execution_results: dict = execution.get("execution_results", {})
             self._log_analysis(final_analysis, f"supervisor:{slug}")
             notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
-            self._persist_context_summary(final_analysis.slug, context)
+            self._persist_context_summary(final_analysis.slug, execution_context)
 
             memory = self._load_client_memory(final_analysis.slug)
             memory["last_action_plan"] = final_analysis.action_plan
@@ -2165,6 +2625,7 @@ class AgentApp:
                 "status": "processed",
                 "analysis": final_analysis,
                 "execution_results": execution_results,
+                "runtime_session_id": str((runtime_session or {}).get("runtime_session_id", "")),
             }
         except Exception as exc:
             self._log_activity(f"[SUPERVISOR] scheduled slug={slug} reason={reason} status=failed error={exc}")
@@ -2285,6 +2746,7 @@ class AgentApp:
                             client_data["description"] = self._profile_description_for_name(
                                 profile,
                                 client_data["name"],
+                            )
                             deterministic_description = (
                                 f"Welcome to {client_data['name']}. "
                                 "We provide quality services to our clients."
@@ -2939,7 +3401,14 @@ class AgentApp:
         self._supervisor_cycle_count += 1
         self._reset_cycle_compute_budget()
         self._scan_existing_clients()
-        self._run_goal_supervisor_cycle()
+        try:
+            self._run_goal_supervisor_event_cycle()
+        except Exception as exc:
+            self._log_activity(
+                f"[EVENT] cycle_failed error={type(exc).__name__}:{exc} fallback=deterministic\n"
+                f"{traceback.format_exc()}"
+            )
+            self._run_goal_supervisor_cycle()
         if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
             self._run_system_learning_cycle()
         if self._auto_mode:
@@ -3329,7 +3798,8 @@ class AgentApp:
             if decision["decision"] == "prioritize":
                 task["priority_score"] = round(self._safe_float(task.get("priority_score", 0.0), 0.0) + 500.0, 3)
             task["exploration_tasks"] = bool(decision.get("exploration_tasks", False))
-            if task["exploration_tasks"] and forced_progress["exploratory_slots"] > 0:
+            task["exploration_task"] = task["exploration_tasks"]
+            if task["exploration_task"] and forced_progress["exploratory_slots"] > 0:
                 forced_progress["exploratory_slots"] -= 1
             filtered.append(task)
 
@@ -3343,6 +3813,7 @@ class AgentApp:
         if not selected and queued and forced_progress["active"]:
             fallback = queued.pop(0)
             fallback["exploration_tasks"] = True
+            fallback["exploration_task"] = True
             fallback["execution_decision"] = {
                 "decision": "execute",
                 "reason": "forced_progress_no_stall",
@@ -3660,6 +4131,125 @@ class AgentApp:
             "delta_units": round(actual_units - self._safe_float(estimated.get("estimated_units", 0.0), 0.0), 3),
         }
         self._update_task_efficiency_stats(task, result, actual_units)
+
+    def _run_goal_supervisor_event_cycle(self) -> None:
+        active_goals = self._load_active_goals()
+        if not active_goals:
+            return
+        runtime = self._load_system_runtime()
+        with self._runtime_bus_lock:
+            persisted_events = runtime.get("pending_events", [])
+            if not self._runtime_bus.get("pending_events") and isinstance(persisted_events, list):
+                self._runtime_bus["pending_events"] = list(persisted_events)
+            self._runtime_bus["goals"] = {
+                str(goal.get("goal_id", "")): dict(goal)
+                for goal in active_goals
+                if isinstance(goal, dict) and str(goal.get("goal_id", ""))
+            }
+            self._runtime_bus["agent_states"] = dict(runtime.get("agent_utilization", {}))
+        cycle_started = time.perf_counter()
+        self._persist_runtime_checkpoint("after_cycle_start_snapshot", runtime)
+        goals_by_id: dict[str, dict] = {}
+        tasks: list[dict] = []
+        created_at = datetime.now().isoformat(timespec="seconds")
+        for goal in active_goals:
+            goal_id = str(goal.get("goal_id", ""))
+            goals_by_id[goal_id] = goal
+            slug = str(goal.get("client_slug", "")).strip()
+            if not slug or not (self.paths["clients"] / slug).exists():
+                continue
+            evaluation = self._evaluate_client_state(slug)
+            self._persist_client_evaluation(slug, evaluation)
+            client_context, session = self._get_client_context_from_session(slug)
+            client_context["evaluation"] = evaluation
+            progress = self._evaluate_goal_progress(goal, client_context)
+            if progress.get("complete", False):
+                now = datetime.now().isoformat(timespec="seconds")
+                self._update_goal_record(
+                    goal_id,
+                    {
+                        "status": GOAL_STATUS_COMPLETED,
+                        "completion_state": "target_met",
+                        "progress": 100,
+                        "last_run": now,
+                        "completed_at": now,
+                    },
+                )
+                runtime["last_goal_completion_time"] = now
+                self._persist_runtime_checkpoint("after_goal_completion", runtime)
+                continue
+            plan = self._plan_goal_actions(goal, client_context, progress)
+            reason = (
+                f"goal_id={goal_id};objective={goal.get('objective', '')};"
+                f"progress={progress['progress_percent']};blocked={progress['blocked']};"
+                f"actions={','.join(progress.get('next_needed_actions', [])) or 'none'}"
+            )
+            task = {
+                "task_id": f"{goal_id or slug}-{created_at}",
+                "client_slug": slug,
+                "goal_id": goal_id,
+                "priority_score": self._score_task_priority(goal, client_context),
+                "status": TASK_STATUS_PENDING,
+                "assigned_agent": "",
+                "created_at": created_at,
+                "reason": reason,
+                "plan": plan,
+                "progress": progress,
+                "next_needed_actions": progress.get("next_needed_actions", []),
+                "repeated_failure": progress.get("repeated_failure", False),
+                "score_gap": progress.get("score_gap", 0.0),
+                "goal_priority": self._safe_float(goal.get("priority", goal.get("priority_score", 5.0)), 5.0),
+                "runtime_session_id": str(session.get("runtime_session_id", "")),
+                "exploration_task": False,
+            }
+            tasks.append(task)
+        runnable, queued, skipped = self._schedule_tasks(tasks, runtime, goals_by_id)
+        for task in runnable + queued + skipped:
+            task["exploration_task"] = bool(task.get("exploration_task", False))
+        for task in skipped:
+            self._log_activity(
+                f"[TASK] skipped task_id={task['task_id']} goal_id={task['goal_id']} "
+                f"reason={task.get('skip_reason', 'low_value')} value={self._safe_float(task.get('value_score', 0.0), 0.0):.2f}"
+            )
+        for task in queued:
+            self._log_activity(
+                f"[TASK] queued task_id={task['task_id']} goal_id={task['goal_id']} "
+                f"slug={task['client_slug']} priority={task['priority_score']:.2f} "
+                f"reason={task.get('defer_reason', 'capacity')}"
+            )
+        cycle_state = {
+            "runtime": runtime,
+            "goals_by_id": goals_by_id,
+            "dispatch_tasks": [],
+            "goal_completion_recorded": False,
+            "progress_advanced": False,
+            "verification_failures": 0,
+        }
+        for task in runnable:
+            self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
+            self._emit_event(EVENT_TASK_READY, {"task": task})
+        if not runnable and queued and runtime.get("forced_progress_active", False):
+            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
+        cycle_budget = max(MIN_CYCLE_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * CYCLE_EVENT_BUDGET_MULTIPLIER)
+        cycle_budget = min(MAX_CYCLE_EVENT_BUDGET, cycle_budget)
+        self._drain_event_queue(cycle_state, cycle_budget)
+        if not cycle_state["progress_advanced"] and queued:
+            self._emit_event(EVENT_EXPLORATION_NEEDED, {"task": queued[0]})
+            retry_budget = max(MIN_RETRY_EVENT_BUDGET, int(runtime.get("max_concurrent_tasks", 5)) * RETRY_EVENT_BUDGET_MULTIPLIER)
+            retry_budget = min(MAX_RETRY_EVENT_BUDGET, retry_budget)
+            self._drain_event_queue(cycle_state, retry_budget)
+        if cycle_state["goal_completion_recorded"] or cycle_state["progress_advanced"]:
+            runtime["cycles_since_progress"] = 0
+        else:
+            runtime["cycles_since_progress"] = max(0, int(runtime.get("cycles_since_progress", 0))) + 1
+        wall_clock = round(max(0.0, time.perf_counter() - cycle_started), 3)
+        self._record_runtime_telemetry(runtime, {"cycle_wall_clock_time": wall_clock})
+        with self._runtime_bus_lock:
+            runtime["runtime_sessions"] = dict(self._runtime_bus.get("runtime_sessions", {}))
+            runtime["pending_events"] = list(self._runtime_bus.get("pending_events", []))
+            runtime["telemetry"] = dict(self._runtime_bus.get("telemetry", {}))
+        self._persist_system_runtime(runtime)
+        self._persist_system_learning_state()
 
     def _run_goal_supervisor_cycle(self) -> None:
         active_goals = self._load_active_goals()
@@ -4345,10 +4935,40 @@ class AgentApp:
             seen.add(ident)
             value.join(timeout)
 
+    def _graceful_shutdown_runtime(self) -> None:
+        runtime = self._load_system_runtime()
+        interrupted_at = datetime.now().isoformat(timespec="seconds")
+        active = runtime.get("active_tasks", [])
+        if not isinstance(active, list):
+            active = []
+        interrupted: list[dict] = []
+        for task in active:
+            if not isinstance(task, dict):
+                continue
+            stamped = dict(task)
+            stamped["status"] = TASK_STATUS_INTERRUPTED
+            stamped["completed_at"] = interrupted_at
+            interrupted.append(stamped)
+            self._register_runtime_task(stamped, str(stamped.get("runtime_session_id", "")))
+        if interrupted:
+            history = runtime.get("task_history", [])
+            if not isinstance(history, list):
+                history = []
+            history.extend(interrupted)
+            runtime["task_history"] = history[-MAX_TASK_HISTORY_SIZE:]
+        runtime["active_tasks"] = []
+        with self._runtime_bus_lock:
+            runtime["pending_events"] = list(self._runtime_bus.get("pending_events", []))
+            runtime["runtime_sessions"] = dict(self._runtime_bus.get("runtime_sessions", {}))
+        self._persist_runtime_checkpoint("before_shutdown", runtime)
+        with self._runtime_bus_lock:
+            self._runtime_bus["pending_events"] = []
+
     def _on_close(self) -> None:
         """Signal background work to stop, wait briefly, then destroy the window."""
         self._auto_mode = False
         self._stop_event.set()
+        self._graceful_shutdown_runtime()
         self._join_background_threads(timeout=2.0)
         self.root.destroy()
 

@@ -123,3 +123,24 @@ Then open **Artifacts** → `Agent-windows-bundle`.
   - protected truth/system files are blocked
   - `COMMAND` disabled unless explicitly enabled via `command_enabled`
 - `clients/<slug>/memory.json` now includes `action_history` for durable execution tracking.
+
+## 10) Phase 18: Agent-native runtime architecture (SSD)
+- Execution is now **memory-first** through an in-process runtime bus that keeps live:
+  - goals
+  - tasks
+  - agent states
+  - runtime sessions
+  - pending events
+- Runtime sessions are persistent and reused per client. Warm context is cached in memory and invalidated only when client source signatures change.
+- Goal execution is now **event-driven** (`task_ready → task_assigned → task_started → task_completed/task_failed`), with verification and escalation events handled in the same runtime core.
+- Task execution uses bounded parallel workers while still honoring:
+  - `max_concurrent_tasks`
+  - per-role agent capacity
+  - compute budget guards
+  - policy/verification/learning hooks
+- SSD JSON remains authoritative for persistence and audit, but writes happen at controlled checkpoints:
+  - cycle start snapshot
+  - task completion batch
+  - verification failures
+  - goal completion
+  - shutdown
