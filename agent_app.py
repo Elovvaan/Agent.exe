@@ -602,7 +602,7 @@ class AgentApp:
             "started_at": str(task.get("started_at", "")),
             "completed_at": str(task.get("completed_at", "")),
             "verification_status": str(task.get("verification_status", "")),
-            "exploration_task": bool(task.get("exploration_tasks", False)),
+            "exploration_task": bool(task.get("exploration_task", task.get("exploration_tasks", False))),
             "runtime_session_id": runtime_session_id,
         }
         with self._runtime_bus_lock:
