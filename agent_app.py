@@ -2516,14 +2516,28 @@ class AgentApp:
         if not isinstance(action_history, list):
             action_history = []
         executed = [entry for entry in action_history if isinstance(entry, dict) and entry.get("stage") == "executed"]
-        recent_executed = executed[-8:]
-        failed_exec = [
-            entry for entry in recent_executed
-            if isinstance(entry.get("result", {}), dict) and entry.get("result", {}).get("status") in {"failed", "rejected"}
-        ]
-        effectiveness = round((len(recent_executed) - len(failed_exec)) / max(1, len(recent_executed)), 2)
-        repeated_failure = len(failed_exec) >= GOAL_FAILURE_ESCALATION_THRESHOLD
 
+        execution_results = memory.get("execution_results", [])
+        if not isinstance(execution_results, list):
+            execution_results = []
+
+        recent_execution_results = [entry for entry in execution_results if isinstance(entry, dict)][-8:]
+        recent_executed = recent_execution_results or executed[-8:]
+        failed_exec = []
+        for entry in recent_executed:
+            status = None
+            if isinstance(entry.get("result", {}), dict):
+                status = entry.get("result", {}).get("status")
+            if status is None:
+                status = entry.get("status")
+            if status in {"failed", "rejected"}:
+                failed_exec.append(entry)
+
+        if recent_executed:
+            effectiveness = round((len(recent_executed) - len(failed_exec)) / len(recent_executed), 2)
+        else:
+            effectiveness = 1.0
+        repeated_failure = bool(recent_executed) and len(failed_exec) >= GOAL_FAILURE_ESCALATION_THRESHOLD
         next_needed_actions: list[str] = []
         if score_gap > 0:
             next_needed_actions.append("improve_quality_score")
