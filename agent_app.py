@@ -1996,7 +1996,8 @@ class AgentApp:
         )
 
         current_score = 1.0 if final_evaluator_ok else 0.7
-        repeated_failure = any(status == "failed" for status in previous_results.values())
+        previous_result_values = previous_results.values() if isinstance(previous_results, dict) else ()
+        repeated_failure = any(status == "failed" for status in previous_result_values)
         if current_score < float(self._learning_controls.get("evaluation_threshold", EVALUATION_THRESHOLD)) or repeated_failure:
             optimizer = self._run_agent(
                 AGENT_OPTIMIZER,
