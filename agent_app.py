@@ -51,6 +51,7 @@ INBOX_SCAN_INTERVAL = 6  # seconds between supervisor scans
 EVALUATION_THRESHOLD = 0.85
 REASONING_CONFIDENCE_THRESHOLD = 0.7
 SYSTEM_LEARNING_INTERVAL_CYCLES = 10
+MAX_TASK_HISTORY_SIZE = 300
 
 ADJUSTMENT_BOUNDS = {
     "evaluation_threshold": {"min": 0.70, "max": 0.95},
@@ -345,7 +346,7 @@ class AgentApp:
         serialized = {
             "max_concurrent_tasks": max(1, int(runtime.get("max_concurrent_tasks", 5))),
             "active_tasks": runtime.get("active_tasks", []) if isinstance(runtime.get("active_tasks", []), list) else [],
-            "task_history": runtime.get("task_history", [])[-300:] if isinstance(runtime.get("task_history", []), list) else [],
+            "task_history": runtime.get("task_history", [])[-MAX_TASK_HISTORY_SIZE:] if isinstance(runtime.get("task_history", []), list) else [],
             "agent_utilization": runtime.get("agent_utilization", {}) if isinstance(runtime.get("agent_utilization", {}), dict) else {},
             "client_priority_map": runtime.get("client_priority_map", {}) if isinstance(runtime.get("client_priority_map", {}), dict) else {},
         }
@@ -2804,7 +2805,7 @@ class AgentApp:
         if not available:
             task["assigned_agent"] = ""
             return ""
-        available.sort(key=lambda role: utilization.get(role, 0) / max(1, pool.get(role, 1)))
+        available.sort(key=lambda role: utilization.get(role, 0) / max(1, pool.get(role, 0)))
         task["assigned_agent"] = available[0]
         return available[0]
 
@@ -2821,7 +2822,7 @@ class AgentApp:
         started["status"] = TASK_STATUS_RUNNING
         started["started_at"] = datetime.now().isoformat(timespec="seconds")
         active_tasks.append(started)
-        runtime["active_tasks"] = active_tasks[-max_concurrent:]
+        runtime["active_tasks"] = active_tasks
         role = str(started.get("assigned_agent", "")).strip()
         if role:
             utilization = runtime.setdefault("agent_utilization", {})
@@ -2851,7 +2852,7 @@ class AgentApp:
         finalized["completed_at"] = datetime.now().isoformat(timespec="seconds")
         finalized["result"] = result
         history.append(finalized)
-        runtime["task_history"] = history[-300:]
+        runtime["task_history"] = history[-MAX_TASK_HISTORY_SIZE:]
         self._persist_system_runtime(runtime)
 
         slug = str(task.get("client_slug", "")).strip()
