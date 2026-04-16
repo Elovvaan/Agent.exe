@@ -1510,34 +1510,41 @@ class AgentApp:
                     reasoning_cta_confidence = 0.0
                     reasoning_cta_fields: list[str] = []
                     reasoning_cta_accepted = False
-                    try:
-                        reasoning_cta = self._run_local_reasoning(context, "improve_cta")
-                        reasoning_cta_confidence = float(reasoning_cta.get("confidence_score", 0.0))
-                        proposals = reasoning_cta.get("proposed_fields", {})
-                        reasoning_cta_fields = sorted(proposals.keys()) if isinstance(proposals, dict) else []
-                        valid_json = self._is_valid_reasoning_output(reasoning_cta)
-                        valid_proposal, validation_reason = self._validate_reasoning_proposals("improve_cta", proposals)
-                        truth_data = context.get("truth_data", {})
-                        truth_primary = str(truth_data.get("cta_primary", "")).strip() if isinstance(truth_data, dict) else ""
-                        truth_secondary = str(truth_data.get("cta_secondary", "")).strip() if isinstance(truth_data, dict) else ""
-                        proposal_primary = str(proposals.get("cta_primary", "")).strip()
-                        proposal_secondary = str(proposals.get("cta_secondary", "")).strip()
-                        conflict_with_truth = (
-                            (truth_primary and proposal_primary and proposal_primary != truth_primary)
-                            or (truth_secondary and proposal_secondary and proposal_secondary != truth_secondary)
-                        )
-                        if not valid_json:
-                            fallback_reason = "invalid_structured_json"
-                        elif reasoning_cta_confidence < REASONING_CONFIDENCE_THRESHOLD:
-                            fallback_reason = "low_confidence"
-                        elif conflict_with_truth:
-                            fallback_reason = "conflicts_with_truth"
-                        elif not valid_proposal:
-                            fallback_reason = validation_reason
-                        else:
-                            reasoning_cta_accepted = True
-                    except Exception as exc:
-                        fallback_reason = f"fallback_due_to_error:{exc}"
+                    needs_cta_generation = (
+                        not client_data.get("cta_primary", "").strip()
+                        or not client_data.get("cta_secondary", "").strip()
+                    )
+                    if needs_cta_generation:
+                        try:
+                            reasoning_cta = self._run_local_reasoning(context, "improve_cta")
+                            reasoning_cta_confidence = float(reasoning_cta.get("confidence_score", 0.0))
+                            proposals = reasoning_cta.get("proposed_fields", {})
+                            reasoning_cta_fields = sorted(proposals.keys()) if isinstance(proposals, dict) else []
+                            valid_json = self._is_valid_reasoning_output(reasoning_cta)
+                            valid_proposal, validation_reason = self._validate_reasoning_proposals("improve_cta", proposals)
+                            truth_data = context.get("truth_data", {})
+                            truth_primary = str(truth_data.get("cta_primary", "")).strip() if isinstance(truth_data, dict) else ""
+                            truth_secondary = str(truth_data.get("cta_secondary", "")).strip() if isinstance(truth_data, dict) else ""
+                            proposal_primary = str(proposals.get("cta_primary", "")).strip()
+                            proposal_secondary = str(proposals.get("cta_secondary", "")).strip()
+                            conflict_with_truth = (
+                                (truth_primary and proposal_primary and proposal_primary != truth_primary)
+                                or (truth_secondary and proposal_secondary and proposal_secondary != truth_secondary)
+                            )
+                            if not valid_json:
+                                fallback_reason = "invalid_structured_json"
+                            elif reasoning_cta_confidence < REASONING_CONFIDENCE_THRESHOLD:
+                                fallback_reason = "low_confidence"
+                            elif conflict_with_truth:
+                                fallback_reason = "conflicts_with_truth"
+                            elif not valid_proposal:
+                                fallback_reason = validation_reason
+                            else:
+                                reasoning_cta_accepted = True
+                        except Exception as exc:
+                            fallback_reason = f"fallback_due_to_error:{exc}"
+                    else:
+                        fallback_reason = "not_needed"
 
                     if not client_data.get("cta_primary", "").strip():
                         if (
