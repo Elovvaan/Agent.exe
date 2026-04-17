@@ -415,8 +415,6 @@ class AgentApp:
             self._load_active_goals()
             self._start_markdown_control_watcher()
             self._poll_markdown_task_controls()
-            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
-            self._auto_thread.start()
             watcher_mode = "event_watcher" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
             self._emit_event(
                 EVENT_SYSTEM_READY,
@@ -427,6 +425,8 @@ class AgentApp:
                 },
                 cycle_state=None,
             )
+            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+            self._auto_thread.start()
             self._log_activity(f"SYSTEM_READY entrypoint=agent_app.py runtime_bus=initialized markdown_watcher={watcher_mode}")
         except Exception as exc:
             try:
@@ -599,7 +599,7 @@ class AgentApp:
         except Exception as exc:
             self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
             if strict:
-                raise RuntimeError(f"failed_to_load_runtime:{exc}") from exc
+                raise RuntimeError(f"failed_to_load_runtime: {exc}") from exc
             self._system_runtime_state = default_runtime
         with self._runtime_bus_lock:
             sessions = self._system_runtime_state.get("runtime_sessions", {})
@@ -1116,10 +1116,10 @@ class AgentApp:
                 return
             self._log_task_complete(task, completion, runtime)
             verification = completion.get("verification", {}) if isinstance(completion.get("verification", {}), dict) else {}
-            verification_passed = bool(verification.get("passed", False))
+            verification_passed = bool(verification.get("passed", False) and completion.get("status") == "success")
             task["status"] = (
                 TASK_STATUS_COMPLETED
-                if verification_passed and completion.get("status") == "success"
+                if verification_passed
                 else TASK_STATUS_FAILED
             )
             task["completed_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1319,7 +1319,7 @@ class AgentApp:
         except Exception as exc:
             self._log_activity(f"[SYSTEM_LEARNING] failed_to_load_state error={exc}")
             if strict:
-                raise RuntimeError(f"failed_to_load_learning_state:{exc}") from exc
+                raise RuntimeError(f"failed_to_load_learning_state: {exc}") from exc
 
     def _persist_system_learning_state(self) -> None:
         payload = {
@@ -3929,7 +3929,11 @@ class AgentApp:
     def _process_markdown_file(self, file_path: Path, cycle_state: dict | None = None, trigger_source: str = "poll") -> int:
         resolved_path = file_path.resolve(strict=False)
         if not self._is_watchable_markdown_path(resolved_path):
-            self._log_activity(f"[MARKDOWN] rejected_input path={resolved_path} reason=outside_clients")
+            try:
+                display_path = str(resolved_path.relative_to(self.base_dir.resolve()))
+            except Exception:
+                display_path = resolved_path.name
+            self._log_activity(f"[MARKDOWN] rejected_input path={display_path} reason=outside_clients")
             return 0
         key = str(resolved_path)
         parsed = self._parse_markdown_tasks(file_path)
@@ -5018,9 +5022,10 @@ class AgentApp:
         self._persist_system_learning_state()
 
     def _run_goal_supervisor_cycle(self) -> None:
-        self._log_activity("[EVENT] legacy_supervisor_cycle_redirect path=canonical_event_runtime")
-        self._run_goal_supervisor_event_cycle()
-        return
+        if not self.config.get("enable_legacy_supervisor_cycle", False):
+            self._log_activity("[EVENT] legacy_supervisor_cycle_redirect path=canonical_event_runtime")
+            self._run_goal_supervisor_event_cycle()
+            return
         active_goals = self._load_active_goals()
         if not active_goals:
             return
