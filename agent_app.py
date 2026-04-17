@@ -137,6 +137,7 @@ EVENT_GOAL_PROGRESS_UPDATED = "goal_progress_updated"
 EVENT_EXPLORATION_NEEDED = "exploration_needed"
 EVENT_OPTIMIZER_ESCALATION = "optimizer_escalation"
 EVENT_MARKDOWN_INJECTION_FAILED = "markdown_injection_failed"
+EVENT_SYSTEM_READY = "system_ready"
 SUPPORTED_EVENT_TYPES = {
     EVENT_TASK_READY,
     EVENT_TASK_ASSIGNED,
@@ -149,6 +150,7 @@ SUPPORTED_EVENT_TYPES = {
     EVENT_EXPLORATION_NEEDED,
     EVENT_OPTIMIZER_ESCALATION,
     EVENT_MARKDOWN_INJECTION_FAILED,
+    EVENT_SYSTEM_READY,
 }
 HIGH_PRIORITY_EVENT_TYPES = {
     EVENT_TASK_FAILED,
@@ -391,27 +393,50 @@ class AgentApp:
         self._markdown_watch_active = False
         self._markdown_watch_failed = False
         self._markdown_runtime_log = self.paths["logs"] / "markdown_runtime.log"
+        self._log_write_lock = threading.Lock()
 
-        self._ensure_core_structure()
-        self._load_system_learning_state()
-        self._load_system_runtime()
-        self._start_markdown_control_watcher()
-        self._poll_markdown_task_controls()
         self._build_ui()
         self.refresh_client_list()
 
         # Clean shutdown when the window is closed
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Background supervisor loop starts immediately
-        self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
-        self._auto_thread.start()
-        watcher_mode = "event_watcher" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
-        self._log_activity(f"SYSTEM_READY entrypoint=agent_app.py runtime_bus=initialized markdown_watcher={watcher_mode}")
+        self._boot_runtime_contract()
 
     # ------------------------------------------------------------------ #
     #  Startup / config
     # ------------------------------------------------------------------ #
+
+    def _boot_runtime_contract(self) -> None:
+        try:
+            self._ensure_core_structure()
+            self._load_system_learning_state(strict=True)
+            self._load_system_runtime(strict=True)
+            self._load_active_goals()
+            self._start_markdown_control_watcher()
+            self._poll_markdown_task_controls()
+            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+            self._auto_thread.start()
+            watcher_mode = "event_watcher" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
+            self._emit_event(
+                EVENT_SYSTEM_READY,
+                {
+                    "entrypoint": "agent_app.py",
+                    "runtime_bus": "initialized",
+                    "markdown_watcher": watcher_mode,
+                },
+                cycle_state=None,
+            )
+            self._log_activity(f"SYSTEM_READY entrypoint=agent_app.py runtime_bus=initialized markdown_watcher={watcher_mode}")
+        except Exception as exc:
+            try:
+                self._stop_event.set()
+                self._stop_markdown_control_watcher()
+            except Exception:
+                pass
+            self._log_error(f"BOOT_FAILED: {type(exc).__name__}: {exc}")
+            self.root.destroy()
+            raise SystemExit(1) from exc
 
     def _resolve_base_dir(self) -> Path:
         if getattr(sys, "frozen", False):
@@ -467,6 +492,29 @@ class AgentApp:
                 except OSError:
                     pass
 
+    def _atomic_append_text(self, path: Path, text: str) -> None:
+        if not text:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_write_lock:
+            existing = ""
+            if path.exists():
+                existing = path.read_text(encoding="utf-8")
+            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            try:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    f.write(existing)
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+
     def _initialize_runtime_bus(self) -> dict:
         return {
             "goals": {},
@@ -497,7 +545,7 @@ class AgentApp:
         serialized = payload if isinstance(payload, dict) else {"active_goals": []}
         self._atomic_write_json(self._system_goals_file(), serialized)
 
-    def _load_system_runtime(self) -> dict:
+    def _load_system_runtime(self, strict: bool = False) -> dict:
         default_runtime = {
             "max_concurrent_tasks": 5,
             "active_tasks": [],
@@ -550,6 +598,8 @@ class AgentApp:
             self.agent_runtime_sessions = sessions if isinstance(sessions, dict) else {}
         except Exception as exc:
             self._log_activity(f"[RUNTIME] failed_to_load_runtime error={exc}")
+            if strict:
+                raise RuntimeError(f"failed_to_load_runtime:{exc}") from exc
             self._system_runtime_state = default_runtime
         with self._runtime_bus_lock:
             sessions = self._system_runtime_state.get("runtime_sessions", {})
@@ -1064,10 +1114,15 @@ class AgentApp:
             completion = payload.get("completion", {}) if isinstance(payload.get("completion", {}), dict) else {}
             if not task:
                 return
-            task["status"] = TASK_STATUS_COMPLETED if event_type == EVENT_TASK_COMPLETED else TASK_STATUS_FAILED
-            task["completed_at"] = datetime.now().isoformat(timespec="seconds")
             self._log_task_complete(task, completion, runtime)
-            verification_passed = bool(completion.get("verification", {}).get("passed", False))
+            verification = completion.get("verification", {}) if isinstance(completion.get("verification", {}), dict) else {}
+            verification_passed = bool(verification.get("passed", False))
+            task["status"] = (
+                TASK_STATUS_COMPLETED
+                if verification_passed and completion.get("status") == "success"
+                else TASK_STATUS_FAILED
+            )
+            task["completed_at"] = datetime.now().isoformat(timespec="seconds")
             task["verification_status"] = "passed" if verification_passed else "failed"
             self._register_runtime_task(task, str(task.get("runtime_session_id", "")))
             self._emit_event(
@@ -1155,6 +1210,13 @@ class AgentApp:
                 f"[MARKDOWN] injection_failed slug={payload.get('client_slug', '')} "
                 f"file={payload.get('source_file', '')} reason={payload.get('reason', 'unknown')}"
             )
+            return
+        if event_type == EVENT_SYSTEM_READY:
+            self._log_activity(
+                f"[SYSTEM] ready entrypoint={payload.get('entrypoint', 'agent_app.py')} "
+                f"runtime_bus={payload.get('runtime_bus', 'initialized')} "
+                f"markdown_watcher={payload.get('markdown_watcher', 'polling')}"
+            )
 
     def _drain_event_queue(self, cycle_state: dict, cycle_budget: int) -> int:
         processed = 0
@@ -1212,7 +1274,7 @@ class AgentApp:
             self._log_activity(f"[GOAL] failed_to_load_goals error={exc}")
             return []
 
-    def _load_system_learning_state(self) -> None:
+    def _load_system_learning_state(self, strict: bool = False) -> None:
         state_file = self._system_learning_file()
         if not state_file.exists():
             self._persist_system_learning_state()
@@ -1256,6 +1318,8 @@ class AgentApp:
                 )
         except Exception as exc:
             self._log_activity(f"[SYSTEM_LEARNING] failed_to_load_state error={exc}")
+            if strict:
+                raise RuntimeError(f"failed_to_load_learning_state:{exc}") from exc
 
     def _persist_system_learning_state(self) -> None:
         payload = {
@@ -3775,9 +3839,9 @@ class AgentApp:
         else:
             task_fingerprint = str(task_fingerprint).strip()
             content_hash = str(content_hash).strip()
-        if not task_fingerprint:
+        if not task_fingerprint or not content_hash:
             return ""
-        return f"{task_fingerprint}:{content_hash}" if content_hash else task_fingerprint
+        return f"{task_fingerprint}:{content_hash}"
 
     def _is_watchable_markdown_path(self, file_path: Path) -> bool:
         path = Path(file_path)
@@ -3863,7 +3927,11 @@ class AgentApp:
         self._process_markdown_file(path, cycle_state=None, trigger_source="watch")
 
     def _process_markdown_file(self, file_path: Path, cycle_state: dict | None = None, trigger_source: str = "poll") -> int:
-        key = str(file_path.resolve())
+        resolved_path = file_path.resolve(strict=False)
+        if not self._is_watchable_markdown_path(resolved_path):
+            self._log_activity(f"[MARKDOWN] rejected_input path={resolved_path} reason=outside_clients")
+            return 0
+        key = str(resolved_path)
         parsed = self._parse_markdown_tasks(file_path)
         parsed_with_signatures = [
             (item, self._markdown_task_signature(item))
@@ -3893,6 +3961,8 @@ class AgentApp:
     def _parse_markdown_tasks(self, file_path: Path) -> list[dict]:
         path = Path(file_path)
         if not path.exists() or path.suffix.lower() != ".md":
+            return []
+        if not self._is_watchable_markdown_path(path.resolve(strict=False)):
             return []
         source = path.read_text(encoding="utf-8")
         content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -3957,6 +4027,19 @@ class AgentApp:
                     continue
                 content_hash = str(parsed.get("content_hash", "")).strip()
                 task_signature = self._markdown_task_signature(parsed, task_fingerprint=task_fingerprint, content_hash=content_hash)
+                if not task_signature:
+                    self._emit_event(
+                        EVENT_MARKDOWN_INJECTION_FAILED,
+                        {
+                            "source": "markdown",
+                            "reason": "missing_dedup_signature",
+                            "client_slug": str(parsed.get("client_slug", client_slug)).strip() or client_slug,
+                            "source_file": parsed.get("source_file", ""),
+                            "line_number": parsed.get("line_number", 0),
+                        },
+                        cycle_state=cycle_state,
+                    )
+                    continue
                 with self._markdown_state_lock:
                     duplicate = task_signature in self._markdown_seen_signatures
                 if duplicate:
@@ -4110,9 +4193,7 @@ class AgentApp:
             },
         }
         try:
-            self._markdown_runtime_log.parent.mkdir(parents=True, exist_ok=True)
-            with self._markdown_runtime_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
+            self._atomic_append_text(self._markdown_runtime_log, json.dumps(record) + "\n")
         except Exception as exc:
             self._log_activity(f"[MARKDOWN] runtime_log_failed error={type(exc).__name__}:{exc}")
 
@@ -4937,6 +5018,9 @@ class AgentApp:
         self._persist_system_learning_state()
 
     def _run_goal_supervisor_cycle(self) -> None:
+        self._log_activity("[EVENT] legacy_supervisor_cycle_redirect path=canonical_event_runtime")
+        self._run_goal_supervisor_event_cycle()
+        return
         active_goals = self._load_active_goals()
         if not active_goals:
             return
@@ -5705,11 +5789,11 @@ class AgentApp:
             logs_path.mkdir(parents=True, exist_ok=True)
             log_file  = logs_path / "agent.log"
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with log_file.open("a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] [ERROR] {message}\n")
-                if sys.exc_info()[0] is not None:
-                    f.write(traceback.format_exc())
-                    f.write("\n")
+            entry = f"[{timestamp}] [ERROR] {message}\n"
+            if sys.exc_info()[0] is not None:
+                entry += traceback.format_exc()
+                entry += "\n"
+            self._atomic_append_text(log_file, entry)
         except Exception:
             pass
 
@@ -5724,8 +5808,7 @@ class AgentApp:
                 "source": source,
                 "analysis": analysis.to_log_dict(),
             }
-            with log_file.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
+            self._atomic_append_text(log_file, json.dumps(record) + "\n")
         except Exception as exc:
             self._log_error(f"Failed to write analysis log entry for source '{source}': {exc}")
 
@@ -5735,8 +5818,7 @@ class AgentApp:
             logs_path.mkdir(parents=True, exist_ok=True)
             log_file  = logs_path / "agent.log"
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with log_file.open("a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] {message}\n")
+            self._atomic_append_text(log_file, f"[{timestamp}] {message}\n")
         except Exception:
             pass
 
