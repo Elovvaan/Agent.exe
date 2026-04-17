@@ -28,6 +28,12 @@ The app will auto-create any missing folders on first launch.
 .\Agent.exe
 ```
 
+- Local Python runtime entrypoint:
+
+```bash
+python agent_app.py
+```
+
 ## 3) Required template placeholders
 `templates/base-site` must include these placeholders across template files:
 

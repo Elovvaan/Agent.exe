@@ -406,6 +406,8 @@ class AgentApp:
         # Background supervisor loop starts immediately
         self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
         self._auto_thread.start()
+        watcher_mode = "event_watcher" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
+        self._log_activity(f"SYSTEM_READY entrypoint=agent_app.py runtime_bus=initialized markdown_watcher={watcher_mode}")
 
     # ------------------------------------------------------------------ #
     #  Startup / config
@@ -438,10 +440,7 @@ class AgentApp:
                 "version": "1.0.0",
                 "tagline": "Portable SSD Web Agency",
             }
-            self.paths["config"].write_text(
-                json.dumps(default_config, indent=2),
-                encoding="utf-8",
-            )
+            self._atomic_write_json(self.paths["config"], default_config)
 
     def _system_learning_file(self) -> Path:
         return self.paths["notes"] / "system_learning.json"
@@ -451,6 +450,22 @@ class AgentApp:
 
     def _system_runtime_file(self) -> Path:
         return self.paths["notes"] / "system_runtime.json"
+
+    def _atomic_write_json(self, path: Path, payload) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
     def _initialize_runtime_bus(self) -> dict:
         return {
@@ -480,7 +495,7 @@ class AgentApp:
 
     def _persist_system_goals(self, payload: dict) -> None:
         serialized = payload if isinstance(payload, dict) else {"active_goals": []}
-        self._system_goals_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+        self._atomic_write_json(self._system_goals_file(), serialized)
 
     def _load_system_runtime(self) -> dict:
         default_runtime = {
@@ -540,6 +555,31 @@ class AgentApp:
             sessions = self._system_runtime_state.get("runtime_sessions", {})
             if isinstance(sessions, dict):
                 self._runtime_bus["runtime_sessions"] = dict(sessions)
+            restored_tasks: dict[str, dict] = {}
+            history_tasks = self._system_runtime_state.get("task_history", [])
+            if isinstance(history_tasks, list):
+                for task in history_tasks:
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = str(task.get("task_id", "")).strip()
+                    if task_id:
+                        restored_tasks[task_id] = dict(task)
+            active_tasks = self._system_runtime_state.get("active_tasks", [])
+            if isinstance(active_tasks, list):
+                for task in active_tasks:
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = str(task.get("task_id", "")).strip()
+                    if not task_id:
+                        continue
+                    existing = restored_tasks.get(task_id)
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(task)
+                        restored_tasks[task_id] = merged
+                    else:
+                        restored_tasks[task_id] = dict(task)
+            self._runtime_bus["tasks"] = restored_tasks
             telemetry = self._system_runtime_state.get("telemetry", {})
             if isinstance(telemetry, dict):
                 self._runtime_bus["telemetry"].update(telemetry)
@@ -579,7 +619,7 @@ class AgentApp:
             if isinstance(session, dict)
         }
         self._system_runtime_state = serialized
-        self._system_runtime_file().write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+        self._atomic_write_json(self._system_runtime_file(), serialized)
 
     def _record_runtime_telemetry(self, runtime: dict, updates: dict) -> None:
         telemetry = runtime.get("telemetry", {})
@@ -1228,7 +1268,7 @@ class AgentApp:
             "active_controls": self._learning_controls,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
-        self._system_learning_file().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._atomic_write_json(self._system_learning_file(), payload)
 
     def _effective_reasoning_threshold(self) -> float:
         base_threshold = float(self._learning_controls.get("reasoning_confidence_threshold", REASONING_CONFIDENCE_THRESHOLD))
@@ -1486,15 +1526,11 @@ class AgentApp:
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
 
-            with notes_file.open("w", encoding="utf-8") as f:
-                json.dump(data.to_dict(), f, indent=2)
+            self._atomic_write_json(notes_file, data.to_dict())
             self._ensure_client_intelligence_profile(client_root)
             policy_path = self._action_policy_path(client_slug)
             if not policy_path.exists():
-                policy_path.write_text(
-                    json.dumps(DEFAULT_ACTION_POLICY, indent=2),
-                    encoding="utf-8",
-                )
+                self._atomic_write_json(policy_path, DEFAULT_ACTION_POLICY)
 
             self.refresh_client_list()
             self.selected_client = client_slug
@@ -1568,10 +1604,7 @@ class AgentApp:
         profile_file = client_root / "notes" / INTELLIGENCE_PROFILE_FILENAME
         if profile_file.exists():
             return
-        profile_file.write_text(
-            json.dumps(DEFAULT_INTELLIGENCE_PROFILE, indent=2),
-            encoding="utf-8",
-        )
+        self._atomic_write_json(profile_file, DEFAULT_INTELLIGENCE_PROFILE)
 
     def _profile_description_for_name(self, profile: dict, name: str) -> str:
         template = str(
@@ -2362,7 +2395,7 @@ class AgentApp:
             })),
             "timestamp": data.get("timestamp", datetime.now().isoformat(timespec="seconds")),
         }
-        memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._atomic_write_json(memory_file, payload)
         self._log_activity(f"[MEMORY] updated slug={slug} path={memory_file}")
 
     def _persist_context_summary(self, slug: str, context: dict) -> None:
@@ -2394,7 +2427,7 @@ class AgentApp:
         policy_path = self._action_policy_path(slug)
         if not policy_path.exists():
             policy_path.parent.mkdir(parents=True, exist_ok=True)
-            policy_path.write_text(json.dumps(DEFAULT_ACTION_POLICY, indent=2), encoding="utf-8")
+            self._atomic_write_json(policy_path, DEFAULT_ACTION_POLICY)
             return dict(DEFAULT_ACTION_POLICY)
         try:
             parsed = json.loads(policy_path.read_text(encoding="utf-8"))
@@ -2862,7 +2895,7 @@ class AgentApp:
             client_data: dict = execution["client_data"]
             execution_results: dict = execution.get("execution_results", {})
             self._log_analysis(final_analysis, f"supervisor:{slug}")
-            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._atomic_write_json(notes_file, client_data)
             self._persist_context_summary(final_analysis.slug, execution_context)
 
             memory = self._load_client_memory(final_analysis.slug)
@@ -3372,7 +3405,7 @@ class AgentApp:
             except Exception:
                 return {"status": "failed", "details": "file_write_outside_safe_outputs"}
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._atomic_write_json(target_path, payload)
             checksum = hashlib.sha256(target_path.read_bytes()).hexdigest()
             return {
                 "status": "success",
@@ -3560,7 +3593,7 @@ class AgentApp:
 
             notes_file = execution["client_root"] / "notes" / "client.json"
             notes_file.parent.mkdir(parents=True, exist_ok=True)
-            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._atomic_write_json(notes_file, client_data)
             self._persist_context_summary(final_analysis.slug, context)
             self._update_client_memory(
                 final_analysis.slug,
@@ -3661,10 +3694,9 @@ class AgentApp:
             self._run_goal_supervisor_event_cycle()
         except Exception as exc:
             self._log_activity(
-                f"[EVENT] cycle_failed error={type(exc).__name__}:{exc} fallback=deterministic\n"
+                f"[EVENT] cycle_failed error={type(exc).__name__}:{exc} path=canonical_event_runtime\n"
                 f"{traceback.format_exc()}"
             )
-            self._run_goal_supervisor_cycle()
         if self._supervisor_cycle_count % SYSTEM_LEARNING_INTERVAL_CYCLES == 0:
             self._run_system_learning_cycle()
         if self._auto_mode:
@@ -5465,7 +5497,7 @@ class AgentApp:
         elif status == JOB_COMPLETED:
             data.pop("error", None)
         try:
-            job_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._atomic_write_json(job_file, data)
         except Exception as exc:
             self._log_activity(f"[WARN] Could not write job.json for {job_dir.name}: {exc}")
 
@@ -5503,7 +5535,7 @@ class AgentApp:
             (client_root / "site").mkdir(parents=True, exist_ok=True)
             (client_root / "notes").mkdir(parents=True, exist_ok=True)
             notes_file = client_root / "notes" / "client.json"
-            notes_file.write_text(json.dumps(client_data, indent=2), encoding="utf-8")
+            self._atomic_write_json(notes_file, client_data)
             self._persist_context_summary(final_analysis.slug, context)
 
             self._update_client_memory(
