@@ -406,7 +406,7 @@ class AgentApp:
         # Background supervisor loop starts immediately
         self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
         self._auto_thread.start()
-        watcher_mode = "event_driven" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
+        watcher_mode = "event_watcher" if self._markdown_watch_active and self._markdown_observer is not None else "polling"
         self._log_activity(f"SYSTEM_READY entrypoint=agent_app.py runtime_bus=initialized markdown_watcher={watcher_mode}")
 
     # ------------------------------------------------------------------ #
@@ -451,9 +451,9 @@ class AgentApp:
     def _system_runtime_file(self) -> Path:
         return self.paths["notes"] / "system_runtime.json"
 
-    def _atomic_write_json(self, path: Path, payload: dict | list) -> None:
+    def _atomic_write_json(self, path: Path, payload) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
             with tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -556,17 +556,28 @@ class AgentApp:
             if isinstance(sessions, dict):
                 self._runtime_bus["runtime_sessions"] = dict(sessions)
             restored_tasks: dict[str, dict] = {}
-            for collection in (
-                self._system_runtime_state.get("active_tasks", []),
-                self._system_runtime_state.get("task_history", []),
-            ):
-                if not isinstance(collection, list):
-                    continue
-                for task in collection:
+            history_tasks = self._system_runtime_state.get("task_history", [])
+            if isinstance(history_tasks, list):
+                for task in history_tasks:
                     if not isinstance(task, dict):
                         continue
                     task_id = str(task.get("task_id", "")).strip()
                     if task_id:
+                        restored_tasks[task_id] = dict(task)
+            active_tasks = self._system_runtime_state.get("active_tasks", [])
+            if isinstance(active_tasks, list):
+                for task in active_tasks:
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = str(task.get("task_id", "")).strip()
+                    if not task_id:
+                        continue
+                    existing = restored_tasks.get(task_id)
+                    if isinstance(existing, dict):
+                        merged = dict(existing)
+                        merged.update(task)
+                        restored_tasks[task_id] = merged
+                    else:
                         restored_tasks[task_id] = dict(task)
             self._runtime_bus["tasks"] = restored_tasks
             telemetry = self._system_runtime_state.get("telemetry", {})
@@ -3394,7 +3405,7 @@ class AgentApp:
             except Exception:
                 return {"status": "failed", "details": "file_write_outside_safe_outputs"}
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            self._atomic_write_json(target_path, payload if isinstance(payload, dict) else {"payload": payload})
+            self._atomic_write_json(target_path, payload)
             checksum = hashlib.sha256(target_path.read_bytes()).hexdigest()
             return {
                 "status": "success",
